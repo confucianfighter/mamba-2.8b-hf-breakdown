@@ -73,7 +73,7 @@ The convolution over compressed context is doing something very similar, but alo
 
 Why not add subtle rope oscilations and increase conv depth to 16 or more?
 
-
+### Here's the config. It can also be found in models/mamba_2.8b_hf_config.json in this repo:
 ```json
 {
   "architectures": [
