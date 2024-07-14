@@ -263,7 +263,7 @@ class Mamba(nn.Module):
         # Selective State-Space Model (SSM) step
         if selective_state_update is None:
             # Discretize A and B using softplus activation
-            # softplus is log(1 + exp(x)). It's being used so that the value is always positive. 
+            # softplus is log(1 + exp(x)). It's being used so that the value is always positive and is a smooth approximation of RelU 
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             
             # Compute dA and dB using matrix multiplication

@@ -33,6 +33,34 @@ This particular model only uses mamba blocks. I included comments in mamba_simpl
 I included the config file for this model in the model folder. I also included full config below.
 Notice that conv kernel dim is only 4. State dims is only 16. While d_model is 2560. This readme is a work in progress and I will add more as I learn.
 
+Here's what I gather so far:
+
+Each block first takes in all outputs in the sequence from the previous block. (The blocks, therefore cannot be parallelized with eachother).
+
+Those outputs are the size of d_model, which in our case is 2560.
+
+Within the block, each  input is projected to a 10,240 dimensional vector, half representing x and half representing z.
+
+z is left alone (it's used to gate the final state output with the swish function (sigmoid of x times x))
+
+From there there is a matrix of learned weights the size of d_conv (4) and x, (5120 at this point). This convolution is performed depthwise along the last 4 5120 dimensional embeddings, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
+
+The output of that is a 5120 dimensional embedding. 
+
+The convolution can be performed in parallel over all available inputs in the sequence.
+
+From that convolution dt, B and C are determined via the x_proj. And all of this can be done in parallel as well. It can be thought of as pre-processing. I'm unclear on exactly how dt, B and C are determined. But dA represents the decay of the previous state, dB is what part of the input should be added, and C is a projection of the state after dA and dB are applied. z ( saved from earlier is how each projection gets gated)
+
+So there is a separate dt dA dB, C and z for each input.
+
+Finally, they are all processed sequentially and that's when the actual state space comes into play. This is the most confusing part for me. If state is truly only 16 dimensional matrix, that's remarkable.
+
+The outputs are projected back down and at the block level RMSNorm or RMSNormGated is applied before passing 'u' on to the next block.
+
+While the convolution on the next block only goes 4 back, when trained end to end, since the next input is based on lots of context gathered from compressed states, the system should be able to learn to apply that convolution across an arbirarily spaced pattern of 4 on each channel.
+
+*note, I'm not sure if dA or dB play more of a role in selective state. I'm guessing it's dB and that dA is a combination of a fixed learned matrix 'A' combined with an input dependent 'dt'.
+
 ```json
 {
   "architectures": [
