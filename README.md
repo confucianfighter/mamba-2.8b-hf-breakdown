@@ -61,6 +61,19 @@ While the convolution on the next block only goes 4 back, when trained end to en
 
 *note, I'm not sure if dA or dB play more of a role in selective state. I'm guessing it's dB and that dA is a combination of a fixed learned matrix 'A' combined with an input dependent 'dt'.
 
+### My own thoughts:
+
+This model is efficient and compressive.
+
+This model could use improvement in capturing long range repeat patterns.
+
+A typical transformer uses rotational positional encoding. It then takes the dot product across each key entry in the entire context and activates with softmax and sums the values accordingly. Inso doing it can capture repeat patterns, albeit innefficiently.
+
+The convolution over compressed context is doing something very similar, but along the columns and at a depth of 4. It's essentially the same operation though. It's very efficient but I'm not so sure it can capture repeat patterns at a depth of 4 even with the compression.
+
+Why not add subtle rope oscilations and increase conv depth to 16 or more?
+
+
 ```json
 {
   "architectures": [
