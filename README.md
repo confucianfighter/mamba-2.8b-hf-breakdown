@@ -33,7 +33,7 @@ This particular model only uses mamba blocks. I included comments in mamba_simpl
 I included the config file for this model in the model folder. I also included full config below.
 Notice that conv kernel dim is only 4. State dims is only 16. While d_model is 2560. This readme is a work in progress and I will add more as I learn.
 
-Here's what I gather so far:
+### Here's what I gather so far:
 
 Each block first takes in all outputs in the sequence from the previous block. (The blocks, therefore cannot be parallelized with eachother).
 
@@ -53,7 +53,7 @@ From that convolution dt, B and C are determined via the x_proj. And all of this
 
 So there is a separate dt dA dB, C and z for each input.
 
-Finally, they are all processed sequentially and that's when the actual state space comes into play. This is the most confusing part for me. If state is truly only 16 dimensional matrix, that's remarkable.
+Finally, they are all processed sequentially and that's when the actual state space comes into play. This is the most confusing part for me. If state is truly only 16 dimensional matrix, that's remarkable. I suspect it's effectively 16 by inner dimension (5120).
 
 The outputs are projected back down and at the block level RMSNorm or RMSNormGated is applied before passing 'u' on to the next block.
 
