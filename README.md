@@ -2,7 +2,7 @@
 [2]: https://github.com/state-spaces/mamba
 [3]: https://github.com/confucianfighter/mamba-2.8b-hf-breakdown/blob/main/mamba_ssm/models/mixer_seq_simple.py
 
-# [Mamba 2.8b hugging face llm][1] breakdown.
+# [Mamba 2.8b hugging face LLM][1] breakdown.
 ***note: original readme appended to bottom for quick access.***
 
 This repo is a clone of the [original mamba repo][2], with documentation and clarifying comments using a specific model.
