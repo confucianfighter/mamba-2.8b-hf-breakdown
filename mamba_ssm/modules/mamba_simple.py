@@ -256,11 +256,14 @@ class Mamba(nn.Module):
         dt = F.linear(dt, self.dt_proj.weight)  # Shape: (batch, d_inner) = (B, 5120)
         
         # Compute A matrix (exponentially decayed)
+        # the result of this function is always the same after training
+        # This is so the weights can be learned on a logarithmic scale. It adds stability to training process.
         A = -torch.exp(self.A_log.float())  # Shape: (d_inner, d_state) = (5120, 16)
 
         # Selective State-Space Model (SSM) step
         if selective_state_update is None:
             # Discretize A and B using softplus activation
+            # softplus is log(1 + exp(x)). It's being used so that the value is always positive. 
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             
             # Compute dA and dB using matrix multiplication

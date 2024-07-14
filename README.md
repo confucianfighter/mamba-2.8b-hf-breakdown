@@ -11,21 +11,66 @@ I'm using the original mamba architecture, simply because the step function in t
 
 The easiest code entry point for mamba LLMs, is in [models/mixer_seq_simple.py][3].
 
-It contains a create block function and two classes:
+It contains a create_block function and two classes:
 - MixerModel(nn.Module)
     - has a list of block instances "layers".
+    - uses the "create_block" function"
+    - 
 - MambaLMHeadModel(nn.Module)
   - has a MixerModel instance called "backbone"
   - has an lm head that projects from model dimensions to vocab dimensions. The values in these outputs being logits (list of next token probabilites)
-
+  - has the learned embeddings for the tokens.
+  - does not have the tokenizer itself.
 
 A block is an abstraction and could be a mamba1 block, a mamba2 block, or a transformer block. It represents the fundamental unit for each architecture. For instance, if it's a transformer block, it includes both the attention mechanism and the FFN.
 
-They are refering to the attention mechanism and mamba equivalents as "mixer_cls"
+They are referring to the attention mechanism and mamba equivalents as "mixer_cls"
 
 They are referring to the ffn and the mamba equivalent as the "mlp_cls".
 
 This particular model only uses mamba blocks. I included comments in mamba_simple.py that breaks down the dimensionality and shape at each step in this 2.8b example.
+
+I included the config file for this model in the model folder. I also included full config below.
+Notice that conv kernel dim is only 4. State dims is only 16. While d_model is 2560. This readme is a work in progress and I will add more as I learn.
+
+```json
+{
+  "architectures": [
+    "MambaForCausalLM"
+  ],
+  "bos_token_id": 0,
+  "conv_kernel": 4,
+  "eos_token_id": 0,
+  "expand": 2,
+  "fused_add_norm": true,
+  "hidden_act": "silu",
+  "hidden_size": 2560,
+  "initializer_range": 0.1,
+  "intermediate_size": 5120,
+  "layer_norm_epsilon": 1e-05,
+  "model_type": "mamba",
+  "n_layer": 64,
+  "num_hidden_layers": 64,
+  "pad_token_id": 0,
+  "pad_vocab_size_multiple": 8,
+  "rescale_prenorm_residual": false,
+  "residual_in_fp32": true,
+  "rms_norm": true,
+  "state_size": 16,
+  "time_step_floor": 0.0001,
+  "time_step_init_scheme": "random",
+  "time_step_max": 0.1,
+  "time_step_min": 0.001,
+  "time_step_rank": 160,
+  "time_step_scale": 1.0,
+  "torch_dtype": "float32",
+  "transformers_version": "4.39.0.dev0",
+  "use_bias": false,
+  "use_cache": true,
+  "use_conv_bias": true,
+  "vocab_size": 50280
+}
+```
 
 -----------------------------------------
 # Original Readme
