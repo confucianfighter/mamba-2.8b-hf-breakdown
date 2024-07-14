@@ -1,3 +1,38 @@
+[1]: https://huggingface.co/state-spaces/mamba-2.8b-hf
+[2]: https://github.com/state-spaces/mamba
+[3]: https://github.com/confucianfighter/mamba-2.8b-hf-breakdown/blob/main/mamba_ssm/models/mixer_seq_simple.py
+
+# [Mamba 2.8b hugging face llm][1] breakdown.
+***note: original readme appended to bottom for quick access.***
+
+This repo is a clone of the [original mamba repo][2], with documentation and clarifying comments using a specific model.
+
+I'm using the original mamba architecture, simply because the step function in that version includes less hardware optimizations and is easier to follow.
+
+The easiest code entry point for mamba LLMs, is in [models/mixer_seq_simple.py][3].
+
+It contains a create block function and two classes:
+- MixerModel(nn.Module)
+    - has a list of block instances "layers".
+- MambaLMHeadModel(nn.Module)
+  - has a MixerModel instance called "backbone"
+  - has an lm head that projects from model dimensions to vocab dimensions. The values in these outputs being logits (list of next token probabilites)
+
+
+A block is an abstraction and could be a mamba1 block, a mamba2 block, or a transformer block. It represents the fundamental unit for each architecture. For instance, if it's a transformer block, it includes both the attention mechanism and the FFN.
+
+They are refering to the attention mechanism and mamba equivalents as "mixer_cls"
+
+They are referring to the ffn and the mamba equivalent as the "mlp_cls".
+
+This particular model only uses mamba blocks. I included comments in mamba_simple.py that breaks down the dimensionality and shape at each step in this 2.8b example.
+
+-----------------------------------------
+# Original Readme
+
+
+
+
 # Mamba
 
 ![Mamba](assets/selection.png "Selective State Space")
@@ -239,6 +274,8 @@ If you use this codebase, or otherwise find our work valuable, please cite Mamba
 }
 
 ```
-#   m a m b a - 2 . 8 b - h f - b r e a k d o w n  
- #   m a m b a - 2 . 8 b - h f - b r e a k d o w n  
+#   m a m b a - 2 . 8 b - h f - b r e a k d o w n 
+ 
+ #   m a m b a - 2 . 8 b - h f - b r e a k d o w n 
+ 
  
