@@ -73,6 +73,10 @@ The convolution over compressed context is doing something very similar, but alo
 
 Why not add subtle rope oscilations and increase conv depth to 16 or more?
 
+Another possibility is to follow the likeness of the transformer, but take the softmax over the rows of the conv and either use that as the conv output, or apply it as z. This way it's compressed and yet you are getting the same performance in a single mamba stage as a single transformer stage. The orientation shouldn't matter much given all the transformations occurring along the way.
+
+But I'm new to ML. So maybe there are some mathematical gotchas here. Like maybe The gradient wouldn't be smooth enough.
+
 ### Here's the config. It can also be found in models/mamba_2.8b_hf_config.json in this repo:
 ```json
 {
