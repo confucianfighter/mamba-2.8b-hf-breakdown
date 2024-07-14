@@ -1,0 +1,426 @@
+
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\utils\generation.py
+
+--------------------------------------------------
+1: # Copyright (c) 2023, Albert Gu, Tri Dao.
+2: import gc
+3: import time
+4: from collections import namedtuple
+5: from dataclasses import dataclass, field
+6: from functools import partial
+7: from typing import Callable, Optional, Sequence, Union
+8: 
+9: import torch
+10: import torch.nn.functional as F
+11: from einops import rearrange, repeat
+12: from torch import Tensor
+13: from torch.profiler import ProfilerActivity, profile, record_function
+14: from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput, TextStreamer
+15: 
+16: 
+17: @dataclass
+18: class InferenceParams:
+19:     """Inference parameters that are passed to the main model in order
+20:     to efficienly calculate and store the context during inference."""
+21: 
+22:     max_seqlen: int
+23:     max_batch_size: int
+24:     seqlen_offset: int = 0
+25:     batch_size_offset: int = 0
+26:     key_value_memory_dict: dict = field(default_factory=dict)
+27:     lengths_per_sample: Optional[Tensor] = None
+28: 
+29:     def reset(self, max_seqlen, max_batch_size):
+30:         self.max_seqlen = max_seqlen
+31:         self.max_batch_size = max_batch_size
+32:         self.seqlen_offset = 0
+33:         if self.lengths_per_sample is not None:
+34:             self.lengths_per_sample.zero_()
+35: 
+36: 
+37: def modify_logits_for_min_p_filtering(logits, min_p):
+38:     """Set the logits for none min_p values to -inf. Done in-place."""
+39:     if min_p <= 0.0 or min_p >= 1.0:
+40:         return
+41:     indices_to_remove = logits < min_p
+42:     logits.masked_fill_(indices_to_remove, float("-Inf"))
+43: # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
+44: # https://github.com/huggingface/transformers/blob/a44985b41cfa2de48a5e1de7f1f93b7483da25d1/src/transformers/generation/logits_process.py#L231
+45: def modify_logits_for_top_k_filtering(logits, top_k):
+46:     """Set the logits for none top-k values to -inf. Done in-place."""
+47:     indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+48:     logits.masked_fill_(indices_to_remove, float("-Inf"))
+49: 
+50: 
+51: # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
+52: # https://github.com/huggingface/transformers/blob/a44985b41cfa2de48a5e1de7f1f93b7483da25d1/src/transformers/generation/logits_process.py#L170
+53: def modify_logits_for_top_p_filtering(logits, top_p):
+54:     """Set the logits for none top-p values to -inf. Done in-place."""
+55:     if top_p <= 0.0 or top_p >= 1.0:
+56:         return
+57:     # First sort and calculate cumulative sum of probabilities.
+58:     sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+59:     cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+60:     # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+61:     sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+62:     # scatter sorted tensors to original indexing
+63:     indices_to_remove = sorted_indices_to_remove.scatter(
+64:         1, sorted_indices, sorted_indices_to_remove
+65:     )
+66:     logits.masked_fill_(indices_to_remove, float("-inf"))
+67: 
+68: 
+69: def modify_logit_for_repetition_penalty(logits, prev_output_tokens, repetition_penalty=1.0):
+70:     """Apply repetition penalty. See https://arxiv.org/abs/1909.05858
+71:     logits: (batch_size, vocab_size)
+72:     prev_output_tokens: (batch_size, seq_len)
+73:     """
+74:     if repetition_penalty == 1.0:
+75:         return logits
+76:     score = torch.gather(logits, 1, prev_output_tokens)
+77:     # if score < 0 then repetition penalty has to be multiplied to reduce the previous token probability
+78:     score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+79:     logits.scatter_(1, prev_output_tokens, score)
+80:     return logits
+81: 
+82: 
+83: def sample(logits, top_k=1, top_p=0.0, min_p=0.0, temperature=1.0):
+84:     """Sample from top-k logits.
+85:     Arguments:
+86:         logits: Tensor of shape (batch_size, vocab_size)
+87:     """
+88:     if top_k == 1:  # Short-circuit for greedy decoding
+89:         return logits.argmax(dim=-1)
+90:     else:
+91:         if top_p > 0.0:
+92:             assert top_p <= 1.0, "top-p should be in (0, 1]."
+93:         if top_k > 0:
+94:             top_k = min(top_k, logits.size(-1))  # Safety check
+95:             logits_top, indices = torch.topk(logits, top_k, dim=-1)
+96:             if temperature != 1.0:
+97:                 logits_top /= temperature
+98:             modify_logits_for_top_p_filtering(logits_top, top_p)
+99:             return indices[
+100:                 torch.arange(indices.shape[0], device=indices.device),
+101:                 torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(dim=-1),
+102:             ]
+103:         else:
+104:             if min_p > 0.0:
+105:                 logits_top = logits.clone()
+106:                 max_prob = logits_top[..., 0].item()
+107:                 min_prob = max_prob * min_p
+108:                 modify_logits_for_min_p_filtering(logits_top, min_prob)
+109:                 if temperature != 1.0:
+110:                     logits_top /= temperature
+111:                 return torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(dim=-1)
+112:             # Clone so that when we modify for top_p we don't change the original logits
+113:             logits_top = logits / temperature if temperature != 1.0 else logits.clone()
+114:             modify_logits_for_top_p_filtering(logits_top, top_p)
+115:             return torch.multinomial(torch.softmax(logits_top, dim=-1), num_samples=1).squeeze(
+116:                 dim=-1
+117:             )
+118: 
+119: 
+120: @torch.inference_mode()
+121: def decode(
+122:     input_ids,
+123:     model,
+124:     max_length,
+125:     top_k=1,
+126:     top_p=0.0,
+127:     min_p=0.0,
+128:     temperature=1.0,
+129:     repetition_penalty=1.0,
+130:     eos_token_id=None,
+131:     teacher_outputs=None,
+132:     vocab_size=None,
+133:     cg=False,
+134:     enable_timing=False,
+135:     streamer: Optional[TextStreamer] = None
+136: ):
+137:     """Decoding, either greedy or with top-k or top-p sampling.
+138:     If top-k = 0, don't limit the number of candidates (pure sampling).
+139:     Top-k and top-p can be used together. If top_k > 0 and top_p > 0, then top-k is applied first,
+140:     then top-p.
+141:     We assume that all sequences in the same batch have the same length.
+142: 
+143:     Arguments:
+144:         input_ids: (batch, seq_len)
+145:         max_length: int
+146:         teacher_outputs (optional): (batch, seq_len). If provided, instead of sampling from the
+147:             logits, the next token is taken from the teacher_outputs. Useful for testing.
+148:     Returns: GreedySearchDecoderOnlyOutput or SampleDecoderOnlyOutput, with the following fields:
+149:         sequences: (batch, max_length)
+150:         scores: tuples of (batch, vocab_size)
+151:     """
+152:     if streamer is not None:
+153:         streamer.put(input_ids.cpu())
+154: 
+155:     batch_size, seqlen_og = input_ids.shape
+156:     teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
+157:     if cg:
+158:         if not hasattr(model, "_decoding_cache"):
+159:             model._decoding_cache = None
+160:         model._decoding_cache = update_graph_cache(
+161:             model,
+162:             model._decoding_cache,
+163:             batch_size,
+164:             seqlen_og,
+165:             max_length,
+166:         )
+167:         inference_params = model._decoding_cache.inference_params
+168:         inference_params.reset(max_length, batch_size)
+169:     else:
+170:         inference_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
+171: 
+172:     def get_logits(input_ids, inference_params):
+173:         decoding = inference_params.seqlen_offset > 0
+174:         if decoding:
+175:             position_ids = torch.full(
+176:                 (batch_size, 1),
+177:                 inference_params.seqlen_offset,
+178:                 dtype=torch.long,
+179:                 device=input_ids.device,
+180:             )
+181:         else:
+182:             position_ids = None
+183:         if not cg or not decoding:
+184:             logits = model(
+185:                 input_ids,
+186:                 position_ids=position_ids,
+187:                 inference_params=inference_params,
+188:                 num_last_tokens=1,
+189:             ).logits.squeeze(dim=1)
+190:         else:
+191:             logits = model._decoding_cache.run(
+192:                 input_ids, position_ids, inference_params.seqlen_offset
+193:             ).squeeze(dim=1)
+194:         return logits[..., :vocab_size] if vocab_size is not None else logits
+195: 
+196:     def sample_tokens(logits, inference_params):
+197:         if teacher_outputs is None or teacher_output_len <= inference_params.seqlen_offset:
+198:             token = sample(logits, top_k=top_k, top_p=top_p, min_p=min_p, temperature=temperature)
+199:         else:
+200:             token = teacher_outputs[:, inference_params.seqlen_offset]
+201:         # return rearrange(token, "b -> b 1")
+202:         return token.unsqueeze(1)
+203: 
+204:     def should_stop(current_token, inference_params):
+205:         if inference_params.seqlen_offset == 0:
+206:             return False
+207:         if eos_token_id is not None and (current_token == eos_token_id).all():
+208:             return True
+209:         if inference_params.seqlen_offset >= max_length - 1:
+210:             return True
+211:         return False
+212: 
+213:     start = torch.cuda.Event(enable_timing=enable_timing)
+214:     end = torch.cuda.Event(enable_timing=enable_timing)
+215: 
+216:     if enable_timing:
+217:         start.record()
+218:     scores, sequences = [], [input_ids]
+219:     sequences_cat = input_ids
+220:     while not should_stop(sequences[-1], inference_params):
+221:         scores.append(get_logits(sequences[-1], inference_params))
+222:         inference_params.seqlen_offset += sequences[-1].shape[1]
+223:         if repetition_penalty == 1.0:
+224:             sampled_tokens = sample_tokens(scores[-1], inference_params)
+225:         else:
+226:             logits = modify_logit_for_repetition_penalty(
+227:                 scores[-1].clone(), sequences_cat, repetition_penalty
+228:             )
+229:             sampled_tokens = sample_tokens(logits, inference_params)
+230:             sequences_cat = torch.cat([sequences_cat, sampled_tokens], dim=1)
+231:         sequences.append(sampled_tokens)
+232:         if streamer is not None:
+233:             streamer.put(sampled_tokens.cpu())
+234:     if streamer is not None:
+235:         streamer.end()
+236:     if enable_timing:
+237:         end.record()
+238:         torch.cuda.synchronize()
+239:         print(f"Prompt processing + decoding time: {(start.elapsed_time(end)):.0f}ms")
+240:     output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
+241:     return output_cls(sequences=torch.cat(sequences, dim=1), scores=tuple(scores))
+242: 
+243: 
+244: class GenerationMixin:
+245:     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+246:         raise NotImplementedError
+247: 
+248:     def generate(
+249:         self,
+250:         input_ids,
+251:         max_length,
+252:         top_k=1,
+253:         top_p=0.0,
+254:         min_p=0.0,
+255:         temperature=1.0,
+256:         return_dict_in_generate=False,
+257:         output_scores=False,
+258:         **kwargs,
+259:     ):
+260:         output = decode(
+261:             input_ids, self, max_length, top_k=top_k, top_p=top_p, min_p = min_p, temperature=temperature, **kwargs
+262:         )
+263:         if not output_scores:
+264:             output.scores = None
+265:         return output if return_dict_in_generate else output.sequences
+266: 
+267: 
+268: @dataclass
+269: class DecodingCGCache:
+270:     max_batch_size: int = 0
+271:     max_seqlen: int = 0
+272:     device = None
+273:     dtype = None
+274:     callables: dict = field(default_factory=dict)
+275:     mempool = None
+276:     inference_params: Optional[InferenceParams] = None
+277:     run: Optional[Callable] = None
+278: 
+279: 
+280: @torch.inference_mode()
+281: def update_graph_cache(
+282:     model,
+283:     cache,
+284:     batch_size,
+285:     seqlen_og,
+286:     max_seqlen,
+287:     decoding_seqlens=(1,),
+288:     dtype=None,
+289:     n_warmups=2,
+290: ):
+291:     if cache is None:
+292:         cache = DecodingCGCache()
+293:     param_example = next(iter(model.parameters()))
+294:     device = param_example.device
+295:     if dtype is None:
+296:         dtype = param_example.dtype
+297:     if (
+298:         (device, dtype) != (cache.device, cache.dtype)
+299:         or batch_size > cache.max_batch_size
+300:         or max_seqlen > cache.max_seqlen
+301:     ):  # Invalidate the cache
+302:         cache.callables = {}
+303:         cache.mempool = None
+304:         cache.inference_params = None
+305:         gc.collect()
+306:         cache.device, cache.dtype = device, dtype
+307:         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
+308:         assert hasattr(model, "allocate_inference_cache"), "CUDA graph decoding requires that the model has a method allocate_inference_cache"
+309:         inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
+310:         lengths_per_sample = torch.full((batch_size,), seqlen_og, dtype=torch.int32, device=device)
+311:         cache.inference_params = InferenceParams(
+312:             max_seqlen=max_seqlen,
+313:             max_batch_size=batch_size,
+314:             seqlen_offset=seqlen_og,
+315:             key_value_memory_dict=inf_cache,
+316:             lengths_per_sample=lengths_per_sample,
+317:         )
+318:         cache.mempool = torch.cuda.graphs.graph_pool_handle()
+319:     for decoding_seqlen in decoding_seqlens:
+320:         if (batch_size, decoding_seqlen) not in cache.callables:
+321:             cache.callables[batch_size, decoding_seqlen] = capture_graph(
+322:                 model,
+323:                 cache.inference_params,
+324:                 batch_size,
+325:                 max_seqlen,
+326:                 decoding_seqlen=decoding_seqlen,
+327:                 mempool=cache.mempool,
+328:                 n_warmups=n_warmups,
+329:             )
+330: 
+331:     def dispatch(input_ids, position_ids, seqlen):
+332:         batch_size, decoding_seqlen = input_ids.shape[:2]
+333:         return cache.callables[batch_size, decoding_seqlen](input_ids, position_ids, seqlen)
+334: 
+335:     cache.run = dispatch
+336:     cache.inference_params.seqlen_offset = 0  # Reset so it's not confusing
+337:     return cache
+338: 
+339: 
+340: def capture_graph(
+341:     model, inference_params, batch_size, max_seqlen, decoding_seqlen=1, mempool=None, n_warmups=2
+342: ):
+343:     device = next(iter(model.parameters())).device
+344:     input_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
+345:     position_ids = torch.full((batch_size, decoding_seqlen), 0, dtype=torch.long, device=device)
+346:     seqlen_offset_og = inference_params.seqlen_offset
+347:     inference_params.seqlen_offset = max_seqlen - decoding_seqlen
+348:     inference_params.lengths_per_sample[:] = inference_params.seqlen_offset
+349: 
+350:     # Warmup before capture
+351:     s = torch.cuda.Stream()
+352:     s.wait_stream(torch.cuda.current_stream())
+353:     with torch.cuda.stream(s):
+354:         for _ in range(n_warmups):
+355:             logits = model(
+356:                 input_ids,
+357:                 position_ids=position_ids,
+358:                 inference_params=inference_params,
+359:                 num_last_tokens=decoding_seqlen,
+360:             ).logits
+361:         s.synchronize()
+362:         # This might be needed for correctness if we run with NCCL_GRAPH_MIXING_SUPPORT=0,
+363:         # which requires that graph launch and non-captured launch to not overlap (I think,
+364:         # that's how I interpret the documentation). I'm not sure if this is required.
+365:         if torch.distributed.is_initialized():
+366:             torch.distributed.barrier()
+367:     torch.cuda.current_stream().wait_stream(s)
+368:     # Captures the graph
+369:     # To allow capture, automatically sets a side stream as the current stream in the context
+370:     graph = torch.cuda.CUDAGraph()
+371:     with torch.cuda.graph(graph, pool=mempool):
+372:         logits = model(
+373:             input_ids,
+374:             position_ids=position_ids,
+375:             inference_params=inference_params,
+376:             num_last_tokens=decoding_seqlen,
+377:         ).logits
+378: 
+379:     def run(new_input_ids, new_position_ids, seqlen):
+380:         inference_params.lengths_per_sample[:] = seqlen
+381:         input_ids.copy_(new_input_ids)
+382:         position_ids.copy_(new_position_ids)
+383:         graph.replay()
+384:         return logits.clone()
+385: 
+386:     inference_params.seqlen_offset = seqlen_offset_og
+387:     return run
+388: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\utils\hf.py
+
+--------------------------------------------------
+1: import json
+2: 
+3: import torch
+4: 
+5: from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
+6: from transformers.utils.hub import cached_file
+7: 
+8: 
+9: def load_config_hf(model_name):
+10:     resolved_archive_file = cached_file(model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
+11:     return json.load(open(resolved_archive_file))
+12: 
+13: 
+14: def load_state_dict_hf(model_name, device=None, dtype=None):
+15:     # If not fp32, then we don't want to load directly to the GPU
+16:     mapped_device = "cpu" if dtype not in [torch.float32, None] else device
+17:     resolved_archive_file = cached_file(model_name, WEIGHTS_NAME, _raise_exceptions_for_missing_entries=False)
+18:     return torch.load(resolved_archive_file, map_location=mapped_device)
+19:     # Convert dtype before moving to GPU to save memory
+20:     if dtype is not None:
+21:         state_dict = {k: v.to(dtype=dtype) for k, v in state_dict.items()}
+22:     state_dict = {k: v.to(device=device) for k, v in state_dict.items()}
+23:     return state_dict
+24: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\utils\__init__.py
+
+--------------------------------------------------
+1: 

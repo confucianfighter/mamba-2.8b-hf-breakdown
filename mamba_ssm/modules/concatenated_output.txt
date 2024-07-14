@@ -1,0 +1,1410 @@
+
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\block.py
+
+--------------------------------------------------
+1: # Copyright (c) 2024, Tri Dao, Albert Gu.
+2: from typing import Optional
+3: 
+4: import torch
+5: from torch import nn, Tensor
+6: 
+7: from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
+8: 
+9: 
+10: class Block(nn.Module):
+11:     def __init__(
+12:         self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+13:     ):
+14:         """
+15:         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
+16: 
+17:         This Block has a slightly different structure compared to a regular
+18:         prenorm Transformer block.
+19:         The standard block is: LN -> MHA/MLP -> Add.
+20:         [Ref: https://arxiv.org/abs/2002.04745]
+21:         Here we have: Add -> LN -> Mixer, returning both
+22:         the hidden_states (output of the mixer) and the residual.
+23:         This is purely for performance reasons, as we can fuse add and LayerNorm.
+24:         The residual needs to be provided (except for the very first block).
+25:         """
+26:         super().__init__()
+27:         self.residual_in_fp32 = residual_in_fp32
+28:         self.fused_add_norm = fused_add_norm
+29:         self.norm = norm_cls(dim)
+30:         self.mixer = mixer_cls(dim)
+31:         if mlp_cls is not nn.Identity:
+32:             self.norm2 = norm_cls(dim)
+33:             self.mlp = mlp_cls(dim)
+34:         else:
+35:             self.mlp = None
+36:         if self.fused_add_norm:
+37:             assert RMSNorm is not None, "RMSNorm import fails"
+38:             assert isinstance(
+39:                 self.norm, (nn.LayerNorm, RMSNorm)
+40:             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+41: 
+42:     def forward(
+43:             self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, **mixer_kwargs
+44:     ):
+45:         r"""Pass the input through the encoder layer.
+46: 
+47:         Args:
+48:             hidden_states: the sequence to the encoder layer (required).
+49:             residual: hidden_states = Mixer(LN(residual))
+50:         """
+51:         if not self.fused_add_norm:
+52:             residual = (hidden_states + residual) if residual is not None else hidden_states
+53:             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+54:             if self.residual_in_fp32:
+55:                 residual = residual.to(torch.float32)
+56:         else:
+57:             hidden_states, residual = layer_norm_fn(
+58:                 hidden_states,
+59:                 self.norm.weight,
+60:                 self.norm.bias,
+61:                 residual=residual,
+62:                 prenorm=True,
+63:                 residual_in_fp32=self.residual_in_fp32,
+64:                 eps=self.norm.eps,
+65:                 is_rms_norm=isinstance(self.norm, RMSNorm)
+66:             )
+67:         hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
+68: 
+69:         if self.mlp is not None:
+70:             if not self.fused_add_norm:
+71:                 residual = hidden_states + residual
+72:                 residual = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
+73:                 if self.residual_in_fp32:
+74:                     residual = residual.to(torch.float32)
+75:             else:
+76:                 hidden_states, residual = layer_norm_fn(
+77:                     hidden_states,
+78:                     self.norm2.weight,
+79:                     self.norm2.bias,
+80:                     residual=residual,
+81:                     prenorm=True,
+82:                     residual_in_fp32=self.residual_in_fp32,
+83:                     eps=self.norm2.eps,
+84:                     is_rms_norm=isinstance(self.norm2, RMSNorm)
+85:                 )
+86:             hidden_states = self.mlp(hidden_states)
+87: 
+88:         return hidden_states, residual
+89: 
+90:     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+91:         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+92: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\mamba2.py
+
+--------------------------------------------------
+1: # Copyright (c) 2024, Tri Dao, Albert Gu.
+2: 
+3: import math
+4: 
+5: import torch
+6: import torch.nn as nn
+7: import torch.nn.functional as F
+8: 
+9: from einops import rearrange, repeat
+10: 
+11: try:
+12:     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+13: except ImportError:
+14:     causal_conv1d_fn, causal_conv1d_update = None, None
+15: 
+16: try:
+17:     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+18: except ImportError:
+19:     selective_state_update = None
+20: 
+21: from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+22: 
+23: from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+24: from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
+25: 
+26: from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+27: from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+28: 
+29: 
+30: class Mamba2(nn.Module):
+31:     def __init__(
+32:         self,
+33:         d_model,
+34:         d_state=128,
+35:         d_conv=4,
+36:         conv_init=None,
+37:         expand=2,
+38:         headdim=64,
+39:         d_ssm=None,  # If not None, we only apply SSM on this many dimensions, the rest uses gated MLP
+40:         ngroups=1,
+41:         A_init_range=(1, 16),
+42:         D_has_hdim=False,
+43:         rmsnorm=True,
+44:         norm_before_gate=False,
+45:         dt_min=0.001,
+46:         dt_max=0.1,
+47:         dt_init_floor=1e-4,
+48:         dt_limit=(0.0, float("inf")),
+49:         bias=False,
+50:         conv_bias=True,
+51:         # Fused kernel and sharding options
+52:         chunk_size=256,
+53:         use_mem_eff_path=True,
+54:         layer_idx=None,  # Absorb kwarg for general module
+55:         process_group=None,
+56:         sequence_parallel=True,
+57:         device=None,
+58:         dtype=None,
+59:     ):
+60:         factory_kwargs = {"device": device, "dtype": dtype}
+61:         super().__init__()
+62:         self.d_model = d_model
+63:         self.d_state = d_state
+64:         self.d_conv = d_conv
+65:         self.conv_init = conv_init
+66:         self.expand = expand
+67:         self.process_group = process_group
+68:         self.sequence_parallel = sequence_parallel
+69:         self.world_size = 1 if process_group is None else process_group.size()
+70:         self.local_rank = 0 if process_group is None else process_group.rank()
+71:         self.d_inner = (self.expand * self.d_model) // self.world_size
+72:         assert self.d_inner * self.world_size == self.expand * self.d_model
+73:         self.headdim = headdim
+74:         self.d_ssm = self.d_inner if d_ssm is None else d_ssm // self.world_size
+75:         assert ngroups % self.world_size == 0
+76:         self.ngroups = ngroups // self.world_size
+77:         assert self.d_ssm % self.headdim == 0
+78:         self.nheads = self.d_ssm // self.headdim
+79:         self.D_has_hdim = D_has_hdim
+80:         self.rmsnorm = rmsnorm
+81:         self.norm_before_gate = norm_before_gate
+82:         self.dt_limit = dt_limit
+83:         self.activation = "silu"
+84:         self.chunk_size = chunk_size
+85:         self.use_mem_eff_path = use_mem_eff_path
+86:         self.layer_idx = layer_idx
+87: 
+88:         # Order: [z, x, B, C, dt]
+89:         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+90:         if self.process_group is None:
+91:             self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+92:         else:
+93:             self.in_proj = ColumnParallelLinear(self.d_model, d_in_proj * self.world_size, bias=bias,
+94:                                                 process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+95:                                                 **factory_kwargs)
+96: 
+97:         conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
+98:         self.conv1d = nn.Conv1d(
+99:             in_channels=conv_dim,
+100:             out_channels=conv_dim,
+101:             bias=conv_bias,
+102:             kernel_size=d_conv,
+103:             groups=conv_dim,
+104:             padding=d_conv - 1,
+105:             **factory_kwargs,
+106:         )
+107:         if self.conv_init is not None:
+108:             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+109: 
+110:         self.act = nn.SiLU()
+111: 
+112:         # Initialize log dt bias
+113:         dt = torch.exp(
+114:             torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+115:             + math.log(dt_min)
+116:         )
+117:         dt = torch.clamp(dt, min=dt_init_floor)
+118:         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+119:         inv_dt = dt + torch.log(-torch.expm1(-dt))
+120:         self.dt_bias = nn.Parameter(inv_dt)
+121:         # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
+122:         # name.endswith("bias") in param_grouping.py
+123:         self.dt_bias._no_weight_decay = True
+124: 
+125:         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+126:         A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+127:         A_log = torch.log(A).to(dtype=dtype)
+128:         self.A_log = nn.Parameter(A_log)
+129:         self.A_log._no_weight_decay = True
+130: 
+131:         # D "skip" parameter
+132:         self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
+133:         self.D._no_weight_decay = True
+134: 
+135:         if self.rmsnorm:
+136:             assert RMSNormGated is not None
+137:             self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
+138:                                      group_size=self.d_ssm // ngroups, **factory_kwargs)
+139: 
+140:         if self.process_group is None:
+141:             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+142:         else:
+143:             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
+144:                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+145:                                               **factory_kwargs)
+146: 
+147:     def forward(self, u, seqlen=None, seq_idx=None, inference_params=None):
+148:         """
+149:         u: (batch, seqlen, hidden_dim) if seqlen=None.
+150:             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
+151:             split u during sequence parallel, we split the batch * seqlen dimension
+152:             (in case batch is small).
+153:         Returns: same shape as u
+154:         """
+155:         seqlen_og = seqlen
+156:         if seqlen is None:
+157:             batch, seqlen, dim = u.shape
+158:         else:
+159:             batch_seqlen, dim = u.shape
+160:             batch = batch_seqlen // seqlen
+161: 
+162:         conv_state, ssm_state = None, None
+163:         if inference_params is not None:
+164:             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+165:             if inference_params.seqlen_offset > 0:
+166:                 # The states are updated inplace
+167:                 out, _, _ = self.step(u, conv_state, ssm_state)
+168:                 return out
+169: 
+170:         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
+171:         if seqlen_og is not None:
+172:             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
+173:         # If the model is loaded in fp16, without the .float() here, A might be -inf
+174:         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
+175:         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+176:         if self.use_mem_eff_path and inference_params is None:
+177:             out = mamba_split_conv1d_scan_combined(
+178:                 zxbcdt,
+179:                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
+180:                 self.conv1d.bias,
+181:                 self.dt_bias,
+182:                 A,
+183:                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+184:                 chunk_size=self.chunk_size,
+185:                 seq_idx=seq_idx,
+186:                 activation=self.activation,
+187:                 rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+188:                 rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+189:                 outproj_weight=self.out_proj.weight,
+190:                 outproj_bias=self.out_proj.bias,
+191:                 headdim=None if self.D_has_hdim else self.headdim,
+192:                 ngroups=self.ngroups,
+193:                 norm_before_gate=self.norm_before_gate,
+194:                 **dt_limit_kwargs,
+195:             )
+196:             if seqlen_og is not None:
+197:                 out = rearrange(out, "b l d -> (b l) d")
+198:             if self.process_group is not None:
+199:                 reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
+200:                 out = reduce_fn(out, self.process_group)
+201:         else:
+202:             d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+203:             z0, x0, z, xBC, dt = torch.split(
+204:                 zxbcdt,
+205:                 [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+206:                 dim=-1
+207:             )
+208:             if conv_state is not None:
+209:                 # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+210:                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+211:                 xBC_t = rearrange(xBC, "b l d -> b d l")
+212:                 conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
+213:             assert self.activation in ["silu", "swish"]
+214:             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+215:                 xBC = self.act(
+216:                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
+217:                 )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
+218:             else:
+219:                 xBC = causal_conv1d_fn(
+220:                     xBC.transpose(1, 2),
+221:                     rearrange(self.conv1d.weight, "d 1 w -> d w"),
+222:                     bias=self.conv1d.bias,
+223:                     activation=self.activation,
+224:                 ).transpose(1, 2)
+225:             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+226:             y = mamba_chunk_scan_combined(
+227:                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+228:                 dt,
+229:                 A,
+230:                 rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+231:                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+232:                 chunk_size=self.chunk_size,
+233:                 D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+234:                 z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+235:                 dt_bias=self.dt_bias,
+236:                 dt_softplus=True,
+237:                 seq_idx=seq_idx,
+238:                 **dt_limit_kwargs,
+239:                 return_final_states=ssm_state is not None,
+240:             )
+241:             if ssm_state is not None:
+242:                 y, last_state = y
+243:                 ssm_state.copy_(last_state)
+244:             y = rearrange(y, "b l h p -> b l (h p)")
+245:             if self.rmsnorm:
+246:                 y = self.norm(y, z)
+247:             if d_mlp > 0:
+248:                 y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+249:             if seqlen_og is not None:
+250:                 y = rearrange(y, "b l d -> (b l) d")
+251:             out = self.out_proj(y)
+252:         return out
+253: 
+254:     def step(self, hidden_states, conv_state, ssm_state):
+255:         dtype = hidden_states.dtype
+256:         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+257:         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+258:         d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
+259:         z0, x0, z, xBC, dt = torch.split(
+260:             zxbcdt,
+261:             [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+262:             dim=-1
+263:         )
+264: 
+265:         # Conv step
+266:         if causal_conv1d_update is None:
+267:             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+268:             conv_state[:, :, -1] = xBC
+269:             xBC = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+270:             if self.conv1d.bias is not None:
+271:                 xBC = xBC + self.conv1d.bias
+272:             xBC = self.act(xBC).to(dtype=dtype)
+273:         else:
+274:             xBC = causal_conv1d_update(
+275:                 xBC,
+276:                 conv_state,
+277:                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
+278:                 self.conv1d.bias,
+279:                 self.activation,
+280:             )
+281: 
+282:         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+283:         A = -torch.exp(self.A_log.float())  # (nheads,)
+284: 
+285:         # SSM step
+286:         if selective_state_update is None:
+287:             assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
+288:             # Discretize A and B
+289:             dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+290:             dA = torch.exp(dt * A)  # (batch, nheads)
+291:             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+292:             dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+293:             ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+294:             y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+295:             y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+296:             y = rearrange(y, "b h p -> b (h p)")
+297:             if not self.rmsnorm:
+298:                 y = y * self.act(z)  # (B D)
+299:         else:
+300:             A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+301:             dt = repeat(dt, "b h -> b h p", p=self.headdim)
+302:             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+303:             D = repeat(self.D, "h -> h p", p=self.headdim)
+304:             B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
+305:             C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
+306:             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+307:             if not self.rmsnorm:
+308:                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+309:             y = selective_state_update(
+310:                 ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
+311:                 dt_bias=dt_bias, dt_softplus=True
+312:             )
+313:             y = rearrange(y, "b h p -> b (h p)")
+314:         if self.rmsnorm:
+315:             y = self.norm(y, z)
+316:         if d_mlp > 0:
+317:             y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+318:         out = self.out_proj(y)
+319:         return out.unsqueeze(1), conv_state, ssm_state
+320: 
+321:     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+322:         device = self.out_proj.weight.device
+323:         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+324:         conv_state = torch.zeros(
+325:             batch_size, self.conv1d.weight.shape[0], self.d_conv, device=device, dtype=conv_dtype
+326:         )
+327:         ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
+328:         ssm_state = torch.zeros(
+329:             batch_size, self.nheads, self.headdim, self.d_state, device=device, dtype=ssm_dtype
+330:         )
+331:         return conv_state, ssm_state
+332: 
+333:     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
+334:         assert self.layer_idx is not None
+335:         if self.layer_idx not in inference_params.key_value_memory_dict:
+336:             batch_shape = (batch_size,)
+337:             conv_state = torch.zeros(
+338:                 batch_size,
+339:                 self.conv1d.weight.shape[0],
+340:                 self.d_conv,
+341:                 device=self.conv1d.weight.device,
+342:                 dtype=self.conv1d.weight.dtype,
+343:             )
+344:             ssm_state = torch.zeros(
+345:                 batch_size,
+346:                 self.nheads,
+347:                 self.headdim,
+348:                 self.d_state,
+349:                 device=self.in_proj.weight.device,
+350:                 dtype=self.in_proj.weight.dtype,
+351:             )
+352:             inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
+353:         else:
+354:             conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_idx]
+355:             # TODO: What if batch size changes between generation, and we reuse the same states?
+356:             if initialize_states:
+357:                 conv_state.zero_()
+358:                 ssm_state.zero_()
+359:         return conv_state, ssm_state
+360: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\mamba2_simple.py
+
+--------------------------------------------------
+1: # Copyright (c) 2024, Tri Dao, Albert Gu.
+2: 
+3: import math
+4: import torch
+5: import torch.nn as nn
+6: import torch.nn.functional as F
+7: 
+8: from einops import rearrange, repeat
+9: 
+10: try:
+11:     from causal_conv1d import causal_conv1d_fn
+12: except ImportError:
+13:     causal_conv1d_fn = None
+14: 
+15: try:
+16:     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated, LayerNorm
+17: except ImportError:
+18:     RMSNormGated, LayerNorm = None, None
+19: 
+20: from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+21: from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+22: 
+23: 
+24: class Mamba2Simple(nn.Module):
+25:     def __init__(
+26:         self,
+27:         d_model,
+28:         d_state=64,
+29:         d_conv=4,
+30:         conv_init=None,
+31:         expand=2,
+32:         headdim=128,
+33:         ngroups=1,
+34:         A_init_range=(1, 16),
+35:         dt_min=0.001,
+36:         dt_max=0.1,
+37:         dt_init_floor=1e-4,
+38:         dt_limit=(0.0, float("inf")),
+39:         learnable_init_states=False,
+40:         activation="swish",
+41:         bias=False,
+42:         conv_bias=True,
+43:         # Fused kernel and sharding options
+44:         chunk_size=256,
+45:         use_mem_eff_path=True,
+46:         layer_idx=None,  # Absorb kwarg for general module
+47:         device=None,
+48:         dtype=None,
+49:     ):
+50:         factory_kwargs = {"device": device, "dtype": dtype}
+51:         super().__init__()
+52:         self.d_model = d_model
+53:         self.d_state = d_state
+54:         self.d_conv = d_conv
+55:         self.conv_init = conv_init
+56:         self.expand = expand
+57:         self.d_inner = self.expand * self.d_model
+58:         self.headdim = headdim
+59:         self.ngroups = ngroups
+60:         assert self.d_inner % self.headdim == 0
+61:         self.nheads = self.d_inner // self.headdim
+62:         self.dt_limit = dt_limit
+63:         self.learnable_init_states = learnable_init_states
+64:         self.activation = activation
+65:         self.chunk_size = chunk_size
+66:         self.use_mem_eff_path = use_mem_eff_path
+67:         self.layer_idx = layer_idx
+68: 
+69:         # Order: [z, x, B, C, dt]
+70:         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+71:         self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+72: 
+73:         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
+74:         self.conv1d = nn.Conv1d(
+75:             in_channels=conv_dim,
+76:             out_channels=conv_dim,
+77:             bias=conv_bias,
+78:             kernel_size=d_conv,
+79:             groups=conv_dim,
+80:             padding=d_conv - 1,
+81:             **factory_kwargs,
+82:         )
+83:         if self.conv_init is not None:
+84:             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+85:         # self.conv1d.weight._no_weight_decay = True
+86: 
+87:         if self.learnable_init_states:
+88:             self.init_states = nn.Parameter(torch.zeros(self.nheads, self.headdim, self.d_state, **factory_kwargs))
+89:             self.init_states._no_weight_decay = True
+90: 
+91:         self.act = nn.SiLU()
+92: 
+93:         # Initialize log dt bias
+94:         dt = torch.exp(
+95:             torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+96:             + math.log(dt_min)
+97:         )
+98:         dt = torch.clamp(dt, min=dt_init_floor)
+99:         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+100:         inv_dt = dt + torch.log(-torch.expm1(-dt))
+101:         self.dt_bias = nn.Parameter(inv_dt)
+102:         # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
+103:         # name.endswith("bias") in param_grouping.py
+104:         self.dt_bias._no_weight_decay = True
+105: 
+106:         # A parameter
+107:         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+108:         A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+109:         A_log = torch.log(A).to(dtype=dtype)
+110:         self.A_log = nn.Parameter(A_log)
+111:         # self.register_buffer("A_log", torch.zeros(self.nheads, dtype=torch.float32, device=device), persistent=True)
+112:         self.A_log._no_weight_decay = True
+113: 
+114:         # D "skip" parameter
+115:         self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+116:         self.D._no_weight_decay = True
+117: 
+118:         # Extra normalization layer right before output projection
+119:         assert RMSNormGated is not None
+120:         self.norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs)
+121: 
+122:         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+123: 
+124:     def forward(self, u, seq_idx=None):
+125:         """
+126:         u: (B, L, D)
+127:         Returns: same shape as u
+128:         """
+129:         batch, seqlen, dim = u.shape
+130: 
+131:         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
+132:         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
+133:         initial_states=repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None
+134:         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
+135: 
+136:         if self.use_mem_eff_path:
+137:             # Fully fused path
+138:             out = mamba_split_conv1d_scan_combined(
+139:                 zxbcdt,
+140:                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
+141:                 self.conv1d.bias,
+142:                 self.dt_bias,
+143:                 A,
+144:                 D=self.D,
+145:                 chunk_size=self.chunk_size,
+146:                 seq_idx=seq_idx,
+147:                 activation=self.activation,
+148:                 rmsnorm_weight=self.norm.weight,
+149:                 rmsnorm_eps=self.norm.eps,
+150:                 outproj_weight=self.out_proj.weight,
+151:                 outproj_bias=self.out_proj.bias,
+152:                 headdim=self.headdim,
+153:                 ngroups=self.ngroups,
+154:                 norm_before_gate=False,
+155:                 initial_states=initial_states,
+156:                 **dt_limit_kwargs,
+157:             )
+158:         else:
+159:             z, xBC, dt = torch.split(
+160:                 zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
+161:             )
+162:             dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
+163:             assert self.activation in ["silu", "swish"]
+164: 
+165:             # 1D Convolution
+166:             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+167:                 xBC = self.act(
+168:                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
+169:                 )  # (B, L, self.d_inner + 2 * ngroups * d_state)
+170:             else:
+171:                 xBC = causal_conv1d_fn(
+172:                     x=xBC.transpose(1, 2),
+173:                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+174:                     bias=self.conv1d.bias,
+175:                     activation=self.activation,
+176:                 ).transpose(1, 2)
+177: 
+178:             # Split into 3 main branches: X, B, C
+179:             # These correspond to V, K, Q respectively in the SSM/attention duality
+180:             x, B, C = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+181:             y = mamba_chunk_scan_combined(
+182:                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+183:                 dt,
+184:                 A,
+185:                 rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+186:                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+187:                 chunk_size=self.chunk_size,
+188:                 D=self.D,
+189:                 z=None,
+190:                 seq_idx=seq_idx,
+191:                 initial_states=initial_states,
+192:                 **dt_limit_kwargs,
+193:             )
+194:             y = rearrange(y, "b l h p -> b l (h p)")
+195: 
+196:             # Multiply "gate" branch and apply extra normalization layer
+197:             y = self.norm(y, z)
+198:             out = self.out_proj(y)
+199:         return out
+200: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\mamba_simple.py
+
+--------------------------------------------------
+1: # Copyright (c) 2023, Tri Dao, Albert Gu.
+2: 
+3: import math
+4: from typing import Optional
+5: 
+6: import torch
+7: import torch.nn as nn
+8: import torch.nn.functional as F
+9: from torch import Tensor
+10: 
+11: from einops import rearrange, repeat
+12: 
+13: from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+14: 
+15: try:
+16:     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+17: except ImportError:
+18:     causal_conv1d_fn, causal_conv1d_update = None, None
+19: 
+20: try:
+21:     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+22: except ImportError:
+23:     selective_state_update = None
+24: 
+25: try:
+26:     from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
+27: except ImportError:
+28:     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+29: 
+30: 
+31: class Mamba(nn.Module):
+32:     def __init__(
+33:         self,
+34:         d_model,
+35:         d_state=16,
+36:         d_conv=4,
+37:         expand=2,
+38:         dt_rank="auto",
+39:         dt_min=0.001,
+40:         dt_max=0.1,
+41:         dt_init="random",
+42:         dt_scale=1.0,
+43:         dt_init_floor=1e-4,
+44:         conv_bias=True,
+45:         bias=False,
+46:         use_fast_path=True,  # Fused kernel options
+47:         layer_idx=None,
+48:         device=None,
+49:         dtype=None,
+50:     ):
+51:         factory_kwargs = {"device": device, "dtype": dtype}
+52:         super().__init__()
+53:         self.d_model = d_model
+54:         self.d_state = d_state
+55:         self.d_conv = d_conv
+56:         self.expand = expand
+57:         self.d_inner = int(self.expand * self.d_model)
+58:         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+59:         self.use_fast_path = use_fast_path
+60:         self.layer_idx = layer_idx
+61: 
+62:         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+63: 
+64:         self.conv1d = nn.Conv1d(
+65:             in_channels=self.d_inner,
+66:             out_channels=self.d_inner,
+67:             bias=conv_bias,
+68:             kernel_size=d_conv,
+69:             groups=self.d_inner,
+70:             padding=d_conv - 1,
+71:             **factory_kwargs,
+72:         )
+73: 
+74:         self.activation = "silu"
+75:         self.act = nn.SiLU()
+76: 
+77:         self.x_proj = nn.Linear(
+78:             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
+79:         )
+80:         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+81: 
+82:         # Initialize special dt projection to preserve variance at initialization
+83:         dt_init_std = self.dt_rank**-0.5 * dt_scale
+84:         if dt_init == "constant":
+85:             nn.init.constant_(self.dt_proj.weight, dt_init_std)
+86:         elif dt_init == "random":
+87:             nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+88:         else:
+89:             raise NotImplementedError
+90: 
+91:         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+92:         dt = torch.exp(
+93:             torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+94:             + math.log(dt_min)
+95:         ).clamp(min=dt_init_floor)
+96:         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+97:         inv_dt = dt + torch.log(-torch.expm1(-dt))
+98:         with torch.no_grad():
+99:             self.dt_proj.bias.copy_(inv_dt)
+100:         # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+101:         self.dt_proj.bias._no_reinit = True
+102: 
+103:         # S4D real initialization
+104:         A = repeat(
+105:             torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+106:             "n -> d n",
+107:             d=self.d_inner,
+108:         ).contiguous()
+109:         A_log = torch.log(A)  # Keep A_log in fp32
+110:         self.A_log = nn.Parameter(A_log)
+111:         self.A_log._no_weight_decay = True
+112: 
+113:         # D "skip" parameter
+114:         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
+115:         self.D._no_weight_decay = True
+116: 
+117:         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+118: 
+119:     def forward(self, hidden_states, inference_params=None):
+120:         """
+121:         hidden_states: (B, L, D)
+122:         Returns: same shape as hidden_states
+123:         """
+124:         batch, seqlen, dim = hidden_states.shape
+125: 
+126:         conv_state, ssm_state = None, None
+127:         if inference_params is not None:
+128:             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+129:             if inference_params.seqlen_offset > 0:
+130:                 # The states are updated inplace
+131:                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+132:                 return out
+133: 
+134:         # We do matmul and transpose BLH -> HBL at the same time
+135:         xz = rearrange(
+136:             self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+137:             "d (b l) -> b d l",
+138:             l=seqlen,
+139:         )
+140:         if self.in_proj.bias is not None:
+141:             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+142: 
+143:         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+144:         # In the backward pass we write dx and dz next to each other to avoid torch.cat
+145:         if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
+146:             out = mamba_inner_fn(
+147:                 xz,
+148:                 self.conv1d.weight,
+149:                 self.conv1d.bias,
+150:                 self.x_proj.weight,
+151:                 self.dt_proj.weight,
+152:                 self.out_proj.weight,
+153:                 self.out_proj.bias,
+154:                 A,
+155:                 None,  # input-dependent B
+156:                 None,  # input-dependent C
+157:                 self.D.float(),
+158:                 delta_bias=self.dt_proj.bias.float(),
+159:                 delta_softplus=True,
+160:             )
+161:         else:
+162:             x, z = xz.chunk(2, dim=1)
+163:             # Compute short convolution
+164:             if conv_state is not None:
+165:                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+166:                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+167:                 conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+168:             if causal_conv1d_fn is None:
+169:                 x = self.act(self.conv1d(x)[..., :seqlen])
+170:             else:
+171:                 assert self.activation in ["silu", "swish"]
+172:                 x = causal_conv1d_fn(
+173:                     x=x,
+174:                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+175:                     bias=self.conv1d.bias,
+176:                     activation=self.activation,
+177:                 )
+178: 
+179:             # We're careful here about the layout, to avoid extra transposes.
+180:             # We want dt to have d as the slowest moving dimension
+181:             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+182:             x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
+183:             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+184:             dt = self.dt_proj.weight @ dt.t()
+185:             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+186:             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+187:             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+188:             assert self.activation in ["silu", "swish"]
+189:             y = selective_scan_fn(
+190:                 x,
+191:                 dt,
+192:                 A,
+193:                 B,
+194:                 C,
+195:                 self.D.float(),
+196:                 z=z,
+197:                 delta_bias=self.dt_proj.bias.float(),
+198:                 delta_softplus=True,
+199:                 return_last_state=ssm_state is not None,
+200:             )
+201:             if ssm_state is not None:
+202:                 y, last_state = y
+203:                 ssm_state.copy_(last_state)
+204:             y = rearrange(y, "b d l -> b l d")
+205:             out = self.out_proj(y)
+206:         return out
+207: 
+208:     def step(self, hidden_states, conv_state, ssm_state):
+209:         dtype = hidden_states.dtype
+210:         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+211:         xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+212:         x, z = xz.chunk(2, dim=-1)  # (B D)
+213: 
+214:         # Conv step
+215:         if causal_conv1d_update is None:
+216:             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+217:             conv_state[:, :, -1] = x
+218:             x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+219:             if self.conv1d.bias is not None:
+220:                 x = x + self.conv1d.bias
+221:             x = self.act(x).to(dtype=dtype)
+222:         else:
+223:             x = causal_conv1d_update(
+224:                 x,
+225:                 conv_state,
+226:                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
+227:                 self.conv1d.bias,
+228:                 self.activation,
+229:             )
+230: 
+231:         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
+232:         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+233:         # Don't add dt_bias here
+234:         dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
+235:         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+236: 
+237:         # SSM step
+238:         if selective_state_update is None:
+239:             # Discretize A and B
+240:             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
+241:             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+242:             dB = torch.einsum("bd,bn->bdn", dt, B)
+243:             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
+244:             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+245:             y = y + self.D.to(dtype) * x
+246:             y = y * self.act(z)  # (B D)
+247:         else:
+248:             y = selective_state_update(
+249:                 ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
+250:             )
+251: 
+252:         out = self.out_proj(y)
+253:         return out.unsqueeze(1), conv_state, ssm_state
+254: 
+255:     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+256:         device = self.out_proj.weight.device
+257:         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+258:         conv_state = torch.zeros(
+259:             batch_size, self.d_model * self.expand, self.d_conv, device=device, dtype=conv_dtype
+260:         )
+261:         ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
+262:         # ssm_dtype = torch.float32
+263:         ssm_state = torch.zeros(
+264:             batch_size, self.d_model * self.expand, self.d_state, device=device, dtype=ssm_dtype
+265:         )
+266:         return conv_state, ssm_state
+267: 
+268:     def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
+269:         assert self.layer_idx is not None
+270:         if self.layer_idx not in inference_params.key_value_memory_dict:
+271:             batch_shape = (batch_size,)
+272:             conv_state = torch.zeros(
+273:                 batch_size,
+274:                 self.d_model * self.expand,
+275:                 self.d_conv,
+276:                 device=self.conv1d.weight.device,
+277:                 dtype=self.conv1d.weight.dtype,
+278:             )
+279:             ssm_state = torch.zeros(
+280:                 batch_size,
+281:                 self.d_model * self.expand,
+282:                 self.d_state,
+283:                 device=self.dt_proj.weight.device,
+284:                 dtype=self.dt_proj.weight.dtype,
+285:                 # dtype=torch.float32,
+286:             )
+287:             inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
+288:         else:
+289:             conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_idx]
+290:             # TODO: What if batch size changes between generation, and we reuse the same states?
+291:             if initialize_states:
+292:                 conv_state.zero_()
+293:                 ssm_state.zero_()
+294:         return conv_state, ssm_state
+295: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\mha.py
+
+--------------------------------------------------
+1: # Copyright (c) 2024, Tri Dao, Albert Gu.
+2: 
+3: import math
+4: 
+5: import torch
+6: import torch.nn as nn
+7: import torch.nn.functional as F
+8: from einops import rearrange
+9: 
+10: try:
+11:     from flash_attn import flash_attn_with_kvcache
+12: except ImportError:
+13:     flash_attn_with_kvcache = None
+14: 
+15: try:
+16:     from flash_attn.layers.rotary import RotaryEmbedding
+17: except ImportError:
+18:     RotaryEmbedding = None
+19: 
+20: try:
+21:     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+22: except ImportError:
+23:     causal_conv1d_fn, causal_conv1d_update = None, None
+24: 
+25: 
+26: def _update_kv_cache(kv, inference_params, layer_idx):
+27:     """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+28:     # Pre-allocate memory for key-values for inference.
+29:     num_heads, head_dim = kv.shape[-2:]
+30:     assert layer_idx in inference_params.key_value_memory_dict
+31:     kv_cache, _ = inference_params.key_value_memory_dict[layer_idx]
+32:     # Adjust key and value for inference
+33:     batch_start = inference_params.batch_size_offset
+34:     batch_end = batch_start + kv.shape[0]
+35:     sequence_start = inference_params.seqlen_offset
+36:     sequence_end = sequence_start + kv.shape[1]
+37:     assert batch_end <= kv_cache.shape[0]
+38:     assert sequence_end <= kv_cache.shape[1]
+39:     assert kv_cache is not None
+40:     kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+41:     return kv_cache[batch_start:batch_end, :sequence_end, ...]
+42: 
+43: 
+44: class MHA(nn.Module):
+45:     """Multi-head self-attention and cross-attention"""
+46: 
+47:     def __init__(
+48:         self,
+49:         embed_dim,
+50:         num_heads,
+51:         num_heads_kv=None,
+52:         head_dim=None,  # If None, use embed_dim // num_heads
+53:         mlp_dim=0,
+54:         qkv_proj_bias=True,
+55:         out_proj_bias=True,
+56:         softmax_scale=None,
+57:         causal=False,
+58:         layer_idx=None,
+59:         d_conv=0,
+60:         rotary_emb_dim=0,
+61:         rotary_emb_base=10000.0,
+62:         rotary_emb_interleaved=False,
+63:         device=None,
+64:         dtype=None,
+65:     ) -> None:
+66:         """
+67:         num_heads_kv: can be used to toggle MQA / GQA. If None, use num_heads.
+68:         return_residual: whether to return the input x along with the output. This is for
+69:             performance reason: for post-norm architecture, returning the input allows us
+70:             to fuse the backward of nn.Linear with the residual connection.
+71:         """
+72:         factory_kwargs = {"device": device, "dtype": dtype}
+73:         super().__init__()
+74:         self.embed_dim = embed_dim
+75:         self.layer_idx = layer_idx
+76:         self.d_conv = d_conv 
+77:         self.rotary_emb_dim = rotary_emb_dim
+78:         self.softmax_scale = softmax_scale
+79:         self.causal = causal
+80: 
+81:         self.num_heads = num_heads
+82:         self.num_heads_kv = num_heads_kv if num_heads_kv is not None else num_heads
+83:         assert (
+84:             self.num_heads % self.num_heads_kv == 0
+85:         ), "num_heads must be divisible by num_heads_kv"
+86:         if head_dim is None:
+87:             assert self.embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+88:         self.head_dim = head_dim if head_dim is not None else self.embed_dim // num_heads
+89:         self.mlp_dim = math.ceil(mlp_dim / 256) * 256
+90:         qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
+91:         out_dim = self.head_dim * self.num_heads
+92: 
+93:         if self.rotary_emb_dim > 0:
+94:             assert RotaryEmbedding is not None, "rotary requires flash_attn to be installed"
+95:             self.rotary_emb = RotaryEmbedding(
+96:                 self.rotary_emb_dim,
+97:                 base=rotary_emb_base,
+98:                 interleaved=rotary_emb_interleaved,
+99:                 device=device,
+100:             )
+101: 
+102:         self.in_proj = nn.Linear(embed_dim, qkv_dim + self.mlp_dim, bias=qkv_proj_bias, **factory_kwargs)
+103:         if self.d_conv > 0:
+104:             self.conv1d = nn.Conv1d(
+105:                 qkv_dim, qkv_dim, kernel_size=self.d_conv, padding=self.d_conv - 1, groups=qkv_dim,
+106:                 **factory_kwargs
+107:             )
+108:         self.out_proj = nn.Linear(out_dim + self.mlp_dim // 2, embed_dim, bias=out_proj_bias, **factory_kwargs)
+109: 
+110:     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+111:         dtype = self.out_proj.weight.dtype if dtype is None else dtype
+112:         device = self.out_proj.weight.device
+113:         if self.d_conv > 0:
+114:             conv_state = torch.zeros(
+115:                 batch_size, self.conv1d.weight.shape[0], self.d_conv, device=device, dtype=dtype
+116:             )
+117:         else:
+118:             conv_state = None
+119:         kv_cache = torch.empty(
+120:             batch_size, max_seqlen, 2, self.num_heads_kv, self.head_dim, dtype=dtype, device=device,
+121:         )
+122:         return kv_cache, conv_state
+123: 
+124:     def _update_kv_cache(self, kv, inference_params):
+125:         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+126:         assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
+127:         return _update_kv_cache(kv, inference_params, self.layer_idx)
+128: 
+129:     def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
+130:         """
+131:         Fast path that combine 3 steps: apply rotary to Q and K, update kv cache, and apply attention.
+132:         q: (batch_size, seqlen_q, nheads, head_dim)
+133:         kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
+134:         """
+135:         assert inference_params is not None and inference_params.seqlen_offset > 0
+136:         if self.rotary_emb_dim > 0:
+137:             self.rotary_emb._update_cos_sin_cache(
+138:                 inference_params.max_seqlen, device=q.device, dtype=q.dtype
+139:             )
+140:             rotary_cos, rotary_sin = self.rotary_emb._cos_cached, self.rotary_emb._sin_cached
+141:         else:
+142:             rotary_cos, rotary_sin = None, None
+143:         batch = q.shape[0]
+144:         kv_cache, _ = inference_params.key_value_memory_dict[self.layer_idx]
+145:         kv_cache = kv_cache[:batch]
+146:         cache_seqlens = (
+147:             inference_params.lengths_per_sample[:batch]
+148:             if inference_params.lengths_per_sample is not None
+149:             else inference_params.seqlen_offset
+150:         )
+151:         assert flash_attn_with_kvcache is not None, "flash_attn must be installed"
+152:         context = flash_attn_with_kvcache(
+153:             q,
+154:             kv_cache[:, :, 0],
+155:             kv_cache[:, :, 1],
+156:             kv[:, :, 0],
+157:             kv[:, :, 1],
+158:             rotary_cos=rotary_cos,
+159:             rotary_sin=rotary_sin,
+160:             cache_seqlens=cache_seqlens,
+161:             softmax_scale=self.softmax_scale,
+162:             causal=self.causal,
+163:             rotary_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
+164:         )
+165:         return context
+166: 
+167:     def _update_kvcache_attention(self, q, kv, inference_params):
+168:         """Write kv to inference_params, then do attention"""
+169:         if (
+170:             inference_params.seqlen_offset == 0
+171:             or flash_attn_with_kvcache is None
+172:         ):
+173:             # TODO: this only uses seqlen_offset and not lengths_per_sample.
+174:             kv = self._update_kv_cache(kv, inference_params)
+175:             k, v = kv.unbind(dim=-3)
+176:             return F.scaled_dot_product_attention(
+177:                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=self.causal, scale=self.softmax_scale
+178:             ).transpose(1, 2)
+179:         else:
+180:             batch = q.shape[0]
+181:             kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+182:             cache_seqlens = (
+183:                 inference_params.lengths_per_sample[:batch]
+184:                 if inference_params.lengths_per_sample is not None
+185:                 else inference_params.seqlen_offset
+186:             )
+187:             return flash_attn_with_kvcache(
+188:                 q,
+189:                 kv_cache[:, :, 0],
+190:                 kv_cache[:, :, 1],
+191:                 kv[:, :, 0],
+192:                 kv[:, :, 1],
+193:                 cache_seqlens=cache_seqlens,
+194:                 softmax_scale=self.softmax_scale,
+195:                 causal=self.causal,
+196:             )
+197: 
+198:     def forward(self, x, inference_params=None):
+199:         """
+200:         Arguments:
+201:             x: (batch, seqlen, hidden_dim) (where hidden_dim = num heads * head dim) if
+202:                 cu_seqlens is None and max_seqlen is None, else (total, hidden_dim) where total
+203:                 is the is the sum of the sequence lengths in the batch.
+204:             inference_params: for generation. Adapted from Megatron-LM (and Apex)
+205:             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
+206:         """
+207:         if inference_params is not None and self.layer_idx not in inference_params.key_value_memory_dict:
+208:             inference_params.key_value_memory_dict[self.layer_idx] = self.allocate_inference_cache(
+209:                 x.shape[0], inference_params.max_seqlen, dtype=x.dtype
+210:             )
+211:         seqlen_offset = (
+212:             0
+213:             if inference_params is None
+214:             else (
+215:                 inference_params.lengths_per_sample
+216:                 if inference_params.lengths_per_sample is not None
+217:                 else inference_params.seqlen_offset
+218:             )
+219:         )
+220:         rotary_max_seqlen = inference_params.max_seqlen if inference_params is not None else None
+221:         qkv = self.in_proj(x)
+222:         if self.mlp_dim > 0:
+223:             qkv, x_mlp = qkv.split([qkv.shape[-1] - self.mlp_dim, self.mlp_dim], dim=-1)
+224:             x_mlp_up, x_mlp_gate = x_mlp.chunk(2, dim=-1)
+225:             x_mlp = x_mlp_up * F.silu(x_mlp_gate)
+226:         if self.d_conv > 0:
+227:             # The inference code for conv1d is pretty messy, should clean it up
+228:             if (inference_params is None or inference_params.seqlen_offset == 0):
+229:                 if causal_conv1d_fn is None:
+230:                     qkv = rearrange(
+231:                         self.conv1d(rearrange(qkv, "b s d -> b d s"))[..., :-(self.d_conv - 1)], "b d s -> b s d"
+232:                     ).contiguous()
+233:                 else:
+234:                     qkv = causal_conv1d_fn(
+235:                         qkv.transpose(1, 2),
+236:                         rearrange(self.conv1d.weight, "d 1 w -> d w"),
+237:                         self.conv1d.bias
+238:                     ).transpose(1, 2)
+239:                 if inference_params is not None:
+240:                     _, conv_state = inference_params.key_value_memory_dict[self.layer_idx]
+241:                     # If we just take qkv[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+242:                     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+243:                     qkv_t = rearrange(qkv, "b l d -> b d l")
+244:                     conv_state.copy_(F.pad(qkv_t, (self.d_conv - qkv_t.shape[-1], 0)))  # Update state (B D W)
+245:             else:
+246:                 _, conv_state = inference_params.key_value_memory_dict[self.layer_idx]
+247:                 assert qkv.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+248:                 qkv = qkv.squeeze(1)
+249:                 # Conv step
+250:                 if causal_conv1d_update is None:
+251:                     conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+252:                     conv_state[:, :, -1] = qkv
+253:                     qkv = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+254:                     if self.conv1d.bias is not None:
+255:                         qkv = qkv + self.conv1d.bias
+256:                 else:
+257:                     qkv = causal_conv1d_update(
+258:                         qkv,
+259:                         conv_state,
+260:                         rearrange(self.conv1d.weight, "d 1 w -> d w"),
+261:                         self.conv1d.bias
+262:                     )
+263:                 qkv = qkv.unsqueeze(1)
+264:         q, kv = qkv.split([self.num_heads * self.head_dim, self.num_heads_kv * 2 * self.head_dim], dim=-1)
+265:         q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+266:         kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+267:         if (
+268:             inference_params is None
+269:             or inference_params.seqlen_offset == 0
+270:             or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+271:         ):
+272:             if self.rotary_emb_dim > 0:
+273:                 q, kv = self.rotary_emb(
+274:                     q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+275:                 )
+276:             if inference_params is None:
+277:                 k, v = kv.unbind(dim=-3)
+278:                 context = F.scaled_dot_product_attention(
+279:                     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=self.causal, scale=self.softmax_scale
+280:                 ).transpose(1, 2)
+281:             else:
+282:                 context = self._update_kvcache_attention(q, kv, inference_params)
+283:         else:
+284:             context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
+285:         context = rearrange(context, "... h d -> ... (h d)")
+286:         if self.mlp_dim > 0:
+287:             context = torch.cat([context, x_mlp], dim=-1)
+288:         out = self.out_proj(context)
+289:         return out
+290: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\mlp.py
+
+--------------------------------------------------
+1: # Copyright (c) 2024, Tri Dao, Albert Gu.
+2: from torch import nn
+3: from torch.nn import functional as F
+4: 
+5: 
+6: class GatedMLP(nn.Module):
+7:     def __init__(
+8:         self,
+9:         in_features,
+10:         hidden_features=None,
+11:         out_features=None,
+12:         activation=F.silu,
+13:         bias=False,
+14:         multiple_of=128,
+15:         device=None,
+16:         dtype=None,
+17:     ):
+18:         factory_kwargs = {"device": device, "dtype": dtype}
+19:         super().__init__()
+20:         out_features = out_features if out_features is not None else in_features
+21:         hidden_features = (
+22:             hidden_features if hidden_features is not None else int(8 * in_features / 3)
+23:         )
+24:         hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
+25:         self.fc1 = nn.Linear(in_features, 2 * hidden_features, bias=bias, **factory_kwargs)
+26:         self.activation = activation
+27:         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, **factory_kwargs)
+28: 
+29:     def forward(self, x):
+30:         y = self.fc1(x)
+31:         y, gate = y.chunk(2, dim=-1)
+32:         y = y * self.activation(gate)
+33:         y = self.fc2(y)
+34:         return y
+35: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\ssd_minimal.py
+
+--------------------------------------------------
+1: # Copyright (c) 2024, Albert Gu and Tri Dao.
+2: """Minimal implementation of SSD.
+3: 
+4: This is the same as Listing 1 from the paper.
+5: """
+6: 
+7: import torch
+8: import torch.nn.functional as F
+9: from einops import rearrange, repeat
+10: 
+11: from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+12: 
+13: 
+14: def segsum_unstable(x):
+15:     """Naive segment sum calculation."""
+16:     T = x.size(-1)
+17:     x_cumsum = torch.cumsum(x, dim=-1)
+18:     x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+19:     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+20:     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+21:     return x_segsum
+22: 
+23: def segsum(x):
+24:     """More stable segment sum calculation."""
+25:     T = x.size(-1)
+26:     x = repeat(x, "... d -> ... d e", e=T)
+27:     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=-1)
+28:     x = x.masked_fill(~mask, 0)
+29:     x_segsum = torch.cumsum(x, dim=-2)
+30:     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+31:     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+32:     return x_segsum
+33: 
+34: def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
+35:     """
+36:     Arguments:
+37:         X: (batch, length, n_heads, d_head)
+38:         A: (batch, length, n_heads)
+39:         B: (batch, length, n_heads, d_state)
+40:         C: (batch, length, n_heads, d_state)
+41:     Return:
+42:         Y: (batch, length, n_heads, d_head)
+43:     """
+44:     assert X.dtype == A.dtype == B.dtype == C.dtype
+45:     assert X.shape[1] % block_len == 0
+46: 
+47:     # Rearrange into blocks/chunks
+48:     X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
+49: 
+50:     A = rearrange(A, "b c l h -> b h c l")
+51:     A_cumsum = torch.cumsum(A, dim=-1)
+52: 
+53:     # 1. Compute the output for each intra-chunk (diagonal blocks)
+54:     L = torch.exp(segsum(A))
+55:     Y_diag  = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
+56: 
+57:     # 2. Compute the state for each intra-chunk
+58:     # (right term of low-rank factorization of off-diagonal blocks; B terms)
+59:     decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+60:     states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
+61: 
+62:     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+63:     # (middle term of factorization of off-diag blocks; A terms)
+64:     if initial_states is None:
+65:         initial_states = torch.zeros_like(states[:, :1])
+66:     states = torch.cat([initial_states, states], dim=1)
+67:     decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+68:     new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+69:     states, final_state = new_states[:, :-1], new_states[:, -1]
+70: 
+71:     # 4. Compute state -> output conversion per chunk
+72:     # (left term of low-rank factorization of off-diagonal blocks; C terms)
+73:     state_decay_out = torch.exp(A_cumsum)
+74:     Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
+75: 
+76:     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+77:     Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
+78:     return Y, final_state
+79: 
+80: 
+81: # Simple test
+82: def test_correctness():
+83:     torch.manual_seed(42)
+84: 
+85:     ## Dimensions
+86:     # Denoted (B, T, Q, D, P) in the paper
+87:     batch, seqlen, chunk_size, dim, headdim = 1, 2048, 64, 2048, 64
+88:     nheads = dim // headdim  # (H) in the paper
+89:     ngroups = 1 # (G) in the paper
+90:     dstate = 64  # (N) in the paper
+91:     dtype = torch.float32
+92:     device = "cuda"
+93: 
+94:     x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=device)
+95:     dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4).requires_grad_()
+96:     A = (-torch.exp(torch.rand(nheads, dtype=torch.float32, device=device))).requires_grad_()
+97:     B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
+98:     C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
+99:     D = torch.randn(nheads, dtype=dtype, device=device)
+100: 
+101:     # Comparing fused version and minimal version
+102:     y = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None)
+103:     y_min, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, chunk_size)
+104: 
+--------------------------------------------------
+C:\Users\Daylan\Mamba2\mamba\mamba_ssm\modules\__init__.py
+
+--------------------------------------------------
+1: 
