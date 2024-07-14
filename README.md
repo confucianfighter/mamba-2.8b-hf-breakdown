@@ -274,8 +274,3 @@ If you use this codebase, or otherwise find our work valuable, please cite Mamba
 }
 
 ```
-#   m a m b a - 2 . 8 b - h f - b r e a k d o w n 
- 
- #   m a m b a - 2 . 8 b - h f - b r e a k d o w n 
- 
- 
