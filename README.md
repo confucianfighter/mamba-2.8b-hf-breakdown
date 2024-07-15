@@ -123,9 +123,11 @@ This model is proven to be efficient and compressive.
 
 The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. And this may not be acting like a typical convolution because it's over compressed states and you want more than just mathematical pattern matching. It's miraculous they can compress so much over a depth of 4. 
 
-However, I can't help but think that by increasing the depth we could capture more long range dependencies and get a much better return on the compression strategy.
+However, I can't help but think that by increasing the depth of the convolution we could capture more long range dependencies and get a much better return on the compression strategy.
 
-Another possibility is to both increase the depth and also do something similar to the horizantal pattern matching of the transformer either in the final state, or over a longer conv input.
+Another possibility is to both increase the depth and also do something similar to the horizontal pattern matching that the transformer does on each entry of the sequence. z is already a projection and could be used at the query. If conv depth were something like 16 or more, a horizontal dot product query could be performed and the softmax of that used in conjunction, say, with C. But I really don't know where you should perform such a query, perhaps it should be at the inputs to the conv, or perhaps at the outputs, or perhaps anywhere else along the way were there is a vector output of inner_dim size and a buffer could be stored.
+
+Or, like they are doing in some mamba models, interleaved transformers might not have as much overhead because the context is highly compressed. So this might all be a moot point I'm making. Let mamba be mamba, transformers be transformers. 
 
 #### My opinion on the logits (nothing to do with mamba)
 
