@@ -115,7 +115,7 @@ From there z further acts as a query and transformation from key to value by gat
 
 While the transformer is more intuitive as a mechanism that matches keys and gives disjointed value outputs based on those keys, mamba is less intuitive to me as of yet. I mean, it's literally convoluted.
 
-My own suspicion is that most of the pattern matching is being done by the convolution. This would seem too homogenous at first, but consider that in a transformer, all transformations are identical for each head, while in this system the pattern query is identical, but the projections are unique for each value.   
+My own suspicion is that most of the pattern matching is being done by the convolution. This would seem too homogenous at first, but consider that in a transformer, all transformations are identical for each head, while in this system the learned convolution is identical, but the projections are unique for each value.   
 
 ### My own thoughts:
 
