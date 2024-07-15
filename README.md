@@ -27,7 +27,7 @@ The main architecture of mamba is within:
   - all parallelizable operations happen within this this class
   - in the case of the hugging face llm, there are 64 layers containing an instance of Mamba and an MLP
   - The instances have their own xzBCdt etc (in case anyone else was confused about that)
-  - The instances do not run in parallel
+  - The instances do not run in parallel, instead all things that can be parallelized are done within a mamba block, the next mamba block must wait.
    
 Within the MixerModel class A block is an abstraction and could be a mamba1 block, a mamba2 block, or a transformer block. It represents the fundamental unit for each architecture. For instance, if it's a transformer block, it includes both the attention mechanism and the FFN.
 
