@@ -65,17 +65,9 @@ While the convolution on the next block only goes 4 back, when trained end to en
 
 This model is efficient and compressive.
 
-This model could use improvement in capturing long range repeat patterns.
+The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. So this may not be acting like a typical convolution. It's miraculous they can compress so much over a depth of 4. Perhaps by increasing the depth we could get a quadratic return in capturing long range dependencies.
 
-A typical transformer uses rotational positional encoding. It then takes the dot product across each key entry in the entire context and activates with softmax and sums the values accordingly. Inso doing it can capture repeat patterns, albeit innefficiently.
-
-The convolution over compressed context is doing something very similar, but along the columns and at a depth of 4. It's essentially the same operation though. It's very efficient but I'm not so sure it can capture repeat patterns at a depth of 4 even with the compression.
-
-Why not add subtle rope oscilations and increase conv depth to 16 or more?
-
-Another possibility is to follow the likeness of the transformer, but take the softmax over the columns of the conv (or rows if you made the conv model_d deep) and either use that as the conv output, or apply it as z. I think this is the reason why it takes two mamba stages to equal 1 transformer stage, and why the transformer / mamba combo is performing better. Mamba is almost doing attention, but without that softmax activation, it's falling short. There's gotta be a way to remedy this.
-
-
+Another possibility is to both increase the depth and also do something similar to the softmax activation on either the columns or rows of the conv, pass the normal conv output forward, but apply that softmax as the gating weights (z).
 
 But I'm new to ML. So maybe there are some mathematical gotchas here. Like maybe The gradient wouldn't be smooth enough.
 
