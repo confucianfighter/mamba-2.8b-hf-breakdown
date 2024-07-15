@@ -61,22 +61,60 @@ The output of that is a 5120 dimensional embedding.
 
 The convolution can be performed in parallel over all available inputs in the sequence.
 
-That 5120 dimensional embedding is sent through an x_projection
-From that convolution dt, B and C are determined via the x_proj. And all of this can be done in parallel as well. It can be thought of as pre-processing. I'm unclear on exactly how dt, B and C are determined. But dA represents the decay of the previous state, dB is what part of the input should be added, and C is a projection of the state after dA and dB are applied. z ( saved from earlier is how each projection gets gated)
+That 5120 dimensional embedding is projected down to 192 dimensions via x_proj as x_db.
 
-So there is a separate dt dA dB, C and z for each input.
+That 192 dimensional x_db vector is split into:
+  - a 160 dimensional dt vector, 
+  - a 16 dimensional B vector, 
+  - and a 16 dimensional C vector.
 
-Finally, they are all processed sequentially and that's when the actual state space comes into play. This is the most confusing part for me. If state is truly only 16 dimensional matrix, that's remarkable. I suspect it's effectively 16 by inner dimension (5120).
+dt is projected from 160 to a 5120 dimensional vector.
 
-The outputs are projected back down and at the block level RMSNorm or RMSNormGated is applied before passing 'u' on to the next block.
+The learned A matrix (16 by 5120) is then computed as the negative exponent of A_log. A_log was stored as the log of A, so this is a retrieval of a fixed learned value. This is done for stability during training.
+
+"A" represents a continuous transition (instantaneous rate of change). It therefore must be "discretized" in order to convert that into time steps. I gather that this is analogous to computing what the daily interest rate should be in order to achieve some compounded result a year from now. Or perhaps the inverse of that.
+
+So from that discretized dt we obtain the discretized dA 
+
+dA is 16 by 5120
+
+dB is calculated using the same operation as A by dt, but without exponentiating the result afterward.
+
+ssm_state (16 by 5120) is then decayed by being multiplied by dA. 
+
+x (the original output from the convolution) is then multiplied by dB and the resulting 16 by 5120 matrix is added to ssm_state.
+
+ssm_state is then multiplied by C(16 dimensions) to obtain the 5120 dimensional y vector.
+
+that same 5120 dimensional x is then multiplied element wise by a learned D vector and added to y (presumably as a normalized residual).
+
+y is then activated  multiplying by the swish of that z vector that was set aside earlier to obtain a 5120 dimensional vector.
+
+That vector is then are projected back down to the model dimensions (2560) and at the block level RMSNorm or RMSNormGated are applied and it's sent through an MLP before passing 'u' on to the next block.
+
+### Why does this work?
 
 While the convolution on the next block only goes 4 back, when trained end to end, since the next input is based on lots of context gathered from compressed states, the system should be able to learn to apply that convolution across an arbitrarily spaced pattern of 4 on each channel.
 
-*note, I'm not sure if dA or dB play more of a role in selective state. I'm guessing it's dB and that dA is a combination of a fixed learned matrix 'A' combined with an input dependent 'dt'.
+Most of the pattern matching that a transformer would do with query and key seem to be via that convolution. 
+
+The state space seems mostly responsible for selective suppression of unimportant information and compression. 
+
+x, B, and C are equated to the V, K, and Q of transformers.
+
+This would seem to make sense, as it is ultimately x that gets added to the state but after being transformed by the dB matrix as a key.
+
+C then retrieves info from the state whilst simultaneously converting it back into an intermediate value through a projection
+
+From there z further acts as a query and transformation from key to value by gating the output.
+
+While the transformer is more intuitive as a mechanism that matches keys and give disparate outputs based on those keys, mamba is less intuitive to me as of yet. I mean, it's literally convoluted.
+
+My own suspicion is that most of the pattern matching is being done by the convolution. 
 
 ### My own thoughts:
 
-This model is efficient and compressive.
+This model is proven to be efficient and compressive.
 
 The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. So this may not be acting like a typical convolution because it's over compressed states and you want more than just mathematical pattern matching. It's miraculous they can compress so much over a depth of 4. 
 

@@ -175,7 +175,7 @@ class Mamba(nn.Module):
                     bias=self.conv1d.bias,
                     activation=self.activation,
                 )
-
+ 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
