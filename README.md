@@ -41,19 +41,19 @@ This particular model only uses mamba blocks. I included comments in mamba_simpl
 
 I included the config file for this model in the model folder. I also included full config further below.
 
-### Here's what I gather so far:
+### Functional Description
 
 We are using a 2560 dimensional model, tokenization occurs elsewhere within the huggingface ecosystem, all the MambaLMHead class needs to know is vocab size and model dimensions and it initializes and stores the learned embeddings of each token.
 
 So during inference, it takes a token ID, looks up the embedding, and performs normalization on it (RMSNorm in our case)
 
-Each block first takes in as many 2560 dimensional embeddings as are available in the sequence. Either the token embeddings or all outputs in the sequence given from the previous block. The blocks, are not parallelizeable because their inputs are dependent on the outputs of the previous block.
+Each block first takes in as many 2560 dimensional embeddings as are available in the sequence. Either the token embeddings or all outputs in the sequence given from the previous block. The blocks, are not parallelizeable because their inputs are dependent on the outputs of the previous block, but most operations on the available sequence are parallizable. But in the step function, sequence length is one and only the previous state and previous 4 convolutional inputs are stored.
 
-Those outputs are the size of d_model, which in our case is 2560.
+Those embeddings are the size of d_model, which in our case is 2560.
 
 Most processing within the block are done on a projection of double the model dimensions. But the first projection is quadruple, each  input is projected to a 10,240 dimensional vector, half representing x and half representing z. 10,240 is double the inner dimensions of the model (5120)
 
-the z half is left alone, though. It is later used to gate the final state output with the swish function during the non parallel part of the state updates swish is sigmoid of x times x, so picture sigmoid of x times x times z.
+the z half is left alone, though. It is later used to gate the final state output with the swish function during the non parallel part of the state update. Swish is sigmoid of x times x, so picture sigmoid of z times z times x.
 
 From there there is a matrix of learned weights the size of d_conv (4) and inner dimensions (5120). This convolution is performed depthwise along the last four 5120 dimensional embeddings in the sequence, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
 
@@ -90,7 +90,10 @@ that same 5120 dimensional x is then multiplied element wise by a learned D vect
 
 y is then activated  multiplying by the swish of that z vector that was set aside earlier to obtain a 5120 dimensional vector.
 
-That vector is then are projected back down to the model dimensions (2560) and at the block level RMSNorm or RMSNormGated are applied and it's sent through an MLP before passing 'u' on to the next block.
+That vector is then projected back down to the model dimensions (2560) and at the block level RMSNorm or RMSNormGated are applied and it's sent through an MLP before passing 'u' on to the next block.
+
+In the case of our LLM, the final output is normalized,projected to a vector of vocab size, and then activated by the softmax function. Each value in this vector represents the probability of that word being the output. These values are collectively referred to as the logits. The system can then select the top logit or randomly from among some top percentile. 
+
 
 ### Why does this work?
 
@@ -124,6 +127,9 @@ Another possibility is to both increase the depth and also do something similar 
 
 But there may be some pattern matching in the state space processing that I'm missing, so this will be updated.
 
+#### My opinion on the logits
+
+Do the logits represent probability, or do we calculate the loss on the logits according to probability because that's the best we can do? We would hope that the logits represent intelligent logical operations from within the system. And if all we needed was probability of the next word, we wouldn't need to train an LLM! We could just keep a large dictionary of NLog probs. Sure it would be big, but it would be a much smaller engineering feat!
 
 ### Here's the config. It can also be found in models/mamba_2.8b_hf_config.json in this repo:
 ```json
