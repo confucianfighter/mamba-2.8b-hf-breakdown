@@ -47,7 +47,9 @@ We are using a 2560 dimensional model, tokenization occurs elsewhere within the 
 
 So during inference, it takes a token ID, looks up the embedding, and performs normalization on it (RMSNorm in our case)
 
-Each block first takes in as many 2560 dimensional embeddings as are available in the sequence. Either the token embeddings or all outputs in the sequence given from the previous block. The blocks, are not parallelizeable because their inputs are dependent on the outputs of the previous block, but most operations on the available sequence are parallizable. But in the step function, sequence length is one and only the previous state and previous 4 convolutional inputs are stored.
+It then passes it to the "backbone" which is all the main layers(blocks) of the system.
+
+Each block first takes in as many 2560 dimensional embeddings as are available in the sequence. Either the token embeddings or all outputs in the sequence given from the previous block. The blocks, are not parallelizeable because their inputs are dependent on the outputs of the previous block, but most operations on the available sequence are parallil izable. But in the step function, sequence length is one and only the previous state and previous 4 convolutional inputs are stored.
 
 Those embeddings are the size of d_model, which in our case is 2560.
 
@@ -55,7 +57,7 @@ Most processing within the block are done on a projection of double the model di
 
 the z half is left alone, though. It is later used to gate the final state output with the swish function during the non parallel part of the state update. Swish is sigmoid of x times x, so picture sigmoid of z times z times x.
 
-From there there is a matrix of learned weights the size of d_conv (4) and inner dimensions (5120). This convolution is performed depthwise along the last four 5120 dimensional embeddings in the sequence, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
+So the x half is taken z, left behind, and from there there is a matrix of learned weights the size of d_conv (4) and inner dimensions (5120). This convolution is performed depthwise along the last four 5120 dimensional embeddings in the sequence, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
 
 The output of that is a 5120 dimensional embedding. 
 
@@ -70,7 +72,7 @@ That 192 dimensional x_db vector is split into:
 
 dt is projected from 160 to a 5120 dimensional vector.
 
-The learned A matrix (16 by 5120) is then computed as the negative exponent of A_log. A_log was stored as the log of A, so this is a retrieval of a fixed learned value. This is done for stability during training.
+The learned A matrix (16 by 5120) is then computed as the negative exponent of A_log. A_log was stored as the log of the A weight matrix, so this is a retrieval of a fixed learned value. This is done for stability during training.
 
 "A" represents a continuous transition (instantaneous rate of change). It therefore must be "discretized" in order to convert that into time steps. I gather that this is analogous to computing what the daily interest rate should be in order to achieve some compounded result a year from now. Or perhaps the inverse of that.
 
@@ -103,7 +105,7 @@ Most of the pattern matching that a transformer would do with query and key seem
 
 The state space seems mostly responsible for selective suppression of unimportant information and compression. 
 
-x, B, and C are equated to the V, K, and Q of transformers.
+However, x, B, and C are equated to the V, K, and Q of transformers.
 
 This would seem to make sense, as it is ultimately x that gets added to the state but after being transformed by the dB matrix as a key.
 
@@ -111,25 +113,23 @@ C then retrieves info from the state whilst simultaneously converting it back in
 
 From there z further acts as a query and transformation from key to value by gating the output.
 
-While the transformer is more intuitive as a mechanism that matches keys and give disparate outputs based on those keys, mamba is less intuitive to me as of yet. I mean, it's literally convoluted.
+While the transformer is more intuitive as a mechanism that matches keys and gives disjointed value outputs based on those keys, mamba is less intuitive to me as of yet. I mean, it's literally convoluted.
 
-My own suspicion is that most of the pattern matching is being done by the convolution. 
+My own suspicion is that most of the pattern matching is being done by the convolution. This would seem too homogenous at first, but consider that in a transformer, all transformations are identical for each head, while in this system the pattern query is identical, but the projections are unique for each value.   
 
 ### My own thoughts:
 
 This model is proven to be efficient and compressive.
 
-The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. So this may not be acting like a typical convolution because it's over compressed states and you want more than just mathematical pattern matching. It's miraculous they can compress so much over a depth of 4. 
+The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. And this may not be acting like a typical convolution because it's over compressed states and you want more than just mathematical pattern matching. It's miraculous they can compress so much over a depth of 4. 
 
-However, I can't help but think that by increasing the depth we could get a quadratic return in capturing long range dependencies and a much better return on the compression strategy.
+However, I can't help but think that by increasing the depth we could capture more long range dependencies and get a much better return on the compression strategy.
 
-Another possibility is to both increase the depth and also do something similar to the softmax activation on either the columns or rows of the conv, pass the conv output forward as is, but apply that softmax as the gating weights (z). If softmax is too sharp in this scenario, perhaps softplus. 
+Another possibility is to both increase the depth and also do something similar to the horizantal pattern matching of the transformer either in the final state, or over a longer conv input.
 
-But there may be some pattern matching in the state space processing that I'm missing, so this will be updated.
+#### My opinion on the logits (nothing to do with mamba)
 
-#### My opinion on the logits
-
-Do the logits represent probability, or do we calculate the loss on the logits according to probability because that's the best we can do? We would hope that the logits represent intelligent logical operations from within the system. And if all we needed was probability of the next word, we wouldn't need to train an LLM! We could just keep a large dictionary of NLog probs. Sure it would be big, but it would be a much smaller engineering feat!
+Do the logits represent probability, or do we calculate the loss on the logits according to probability because that's the best we can do during pretraining? We would hope that the logits represent intelligent logical operations from within the system. And if all we needed was probability of the next word, we wouldn't need to train an LLM! We could just keep a large dictionary of NLog probs. Sure it would be big, but it would be a much smaller engineering feat!
 
 ### Here's the config. It can also be found in models/mamba_2.8b_hf_config.json in this repo:
 ```json
