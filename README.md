@@ -15,39 +15,53 @@ It contains a create_block function and two classes:
 - MixerModel(nn.Module)
     - has a list of block instances "layers".
     - uses the "create_block" function"
-    - 
 - MambaLMHeadModel(nn.Module)
   - has a MixerModel instance called "backbone"
   - has an lm head that projects from model dimensions to vocab dimensions. The values in these outputs being logits (list of next token probabilites)
   - has the learned embeddings for the tokens.
   - does not have the tokenizer itself.
 
-A block is an abstraction and could be a mamba1 block, a mamba2 block, or a transformer block. It represents the fundamental unit for each architecture. For instance, if it's a transformer block, it includes both the attention mechanism and the FFN.
+The main architecture of mamba is within:
 
-They are referring to the attention mechanism and mamba equivalents as "mixer_cls"
+- Mamba(nn.Module)
+  - all parallelizable operations happen within this this class
+  - in the case of the hugging face llm, there are 64 layers containing an instance of Mamba and an MLP
+  - The instances have their own xzBCdt etc (in case anyone else was confused about that)
+  - The instances do not run in parallel
+   
+Within the MixerModel class A block is an abstraction and could be a mamba1 block, a mamba2 block, or a transformer block. It represents the fundamental unit for each architecture. For instance, if it's a transformer block, it includes both the attention mechanism and the FFN.
 
-They are referring to the ffn and the mamba equivalent as the "mlp_cls".
+There is a list called transformer_idx within MixerModel that contains indices of all blocks that should be implemented as transformers.
+
+MixerModel refers to the attention mechanism type (mamba1, mamba2 or transformer) as the mixer_cls.
+
+They are referring to the transformer FFN and the mamba equivalent as the "mlp_cls".
 
 This particular model only uses mamba blocks. I included comments in mamba_simple.py that breaks down the dimensionality and shape at each step in this 2.8b example.
 
-I included the config file for this model in the model folder. I also included full config below.
+I included the config file for this model in the model folder. I also included full config further below.
 
 ### Here's what I gather so far:
 
-Each block first takes in all outputs in the sequence from the previous block. (The blocks, therefore cannot be parallelized with eachother).
+We are using a 2560 dimensional model, tokenization occurs elsewhere within the huggingface ecosystem, all the MambaLMHead class needs to know is vocab size and model dimensions and it initializes and stores the learned embeddings of each token.
+
+So during inference, it takes a token ID, looks up the embedding, and performs normalization on it (RMSNorm in our case)
+
+Each block first takes in as many 2560 dimensional embeddings as are available in the sequence. Either the token embeddings or all outputs in the sequence given from the previous block. The blocks, are not parallelizeable because their inputs are dependent on the outputs of the previous block.
 
 Those outputs are the size of d_model, which in our case is 2560.
 
-Within the block, each  input is projected to a 10,240 dimensional vector, half representing x and half representing z. 10,240 is double the inner dimensions of the model (5120)
+Most processing within the block are done on a projection of double the model dimensions. But the first projection is quadruple, each  input is projected to a 10,240 dimensional vector, half representing x and half representing z. 10,240 is double the inner dimensions of the model (5120)
 
-z is left alone, it is later used to gate the final state output with the swish function during the non parallel part of the state updates ((sigmoid of x times x) times z)
+the z half is left alone, though. It is later used to gate the final state output with the swish function during the non parallel part of the state updates swish is sigmoid of x times x, so picture sigmoid of x times x times z.
 
-From there there is a matrix of learned weights the size of d_conv (4) and x, (5120 at this point). This convolution is performed depthwise along the last four 5120 dimensional embeddings, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
+From there there is a matrix of learned weights the size of d_conv (4) and inner dimensions (5120). This convolution is performed depthwise along the last four 5120 dimensional embeddings in the sequence, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
 
 The output of that is a 5120 dimensional embedding. 
 
 The convolution can be performed in parallel over all available inputs in the sequence.
 
+That 5120 dimensional embedding is sent through an x_projection
 From that convolution dt, B and C are determined via the x_proj. And all of this can be done in parallel as well. It can be thought of as pre-processing. I'm unclear on exactly how dt, B and C are determined. But dA represents the decay of the previous state, dB is what part of the input should be added, and C is a projection of the state after dA and dB are applied. z ( saved from earlier is how each projection gets gated)
 
 So there is a separate dt dA dB, C and z for each input.
@@ -69,6 +83,9 @@ The convolution seems to be doing something very similar to the pattern matching
 However, I can't help but think that by increasing the depth we could get a quadratic return in capturing long range dependencies and a much better return on the compression strategy.
 
 Another possibility is to both increase the depth and also do something similar to the softmax activation on either the columns or rows of the conv, pass the conv output forward as is, but apply that softmax as the gating weights (z). If softmax is too sharp in this scenario, perhaps softplus. 
+
+But there may be some pattern matching in the state space processing that I'm missing, so this will be updated.
+
 
 ### Here's the config. It can also be found in models/mamba_2.8b_hf_config.json in this repo:
 ```json
