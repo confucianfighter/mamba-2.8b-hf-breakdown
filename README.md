@@ -31,7 +31,6 @@ They are referring to the ffn and the mamba equivalent as the "mlp_cls".
 This particular model only uses mamba blocks. I included comments in mamba_simple.py that breaks down the dimensionality and shape at each step in this 2.8b example.
 
 I included the config file for this model in the model folder. I also included full config below.
-Notice that conv kernel dim is only 4. State dims is only 16. While d_model is 2560. This readme is a work in progress and I will add more as I learn.
 
 ### Here's what I gather so far:
 
@@ -39,11 +38,11 @@ Each block first takes in all outputs in the sequence from the previous block. (
 
 Those outputs are the size of d_model, which in our case is 2560.
 
-Within the block, each  input is projected to a 10,240 dimensional vector, half representing x and half representing z.
+Within the block, each  input is projected to a 10,240 dimensional vector, half representing x and half representing z. 10,240 is double the inner dimensions of the model (5120)
 
-z is left alone (it's used to gate the final state output with the swish function (sigmoid of x times x))
+z is left alone, it is later used to gate the final state output with the swish function during the non parallel part of the state updates ((sigmoid of x times x) times z)
 
-From there there is a matrix of learned weights the size of d_conv (4) and x, (5120 at this point). This convolution is performed depthwise along the last 4 5120 dimensional embeddings, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
+From there there is a matrix of learned weights the size of d_conv (4) and x, (5120 at this point). This convolution is performed depthwise along the last four 5120 dimensional embeddings, such that there is a separate and unique convolution for each of 5120 channels. The convolution is taken as a simple dot product of 4 values at each channel.
 
 The output of that is a 5120 dimensional embedding. 
 
@@ -57,7 +56,7 @@ Finally, they are all processed sequentially and that's when the actual state sp
 
 The outputs are projected back down and at the block level RMSNorm or RMSNormGated is applied before passing 'u' on to the next block.
 
-While the convolution on the next block only goes 4 back, when trained end to end, since the next input is based on lots of context gathered from compressed states, the system should be able to learn to apply that convolution across an arbirarily spaced pattern of 4 on each channel.
+While the convolution on the next block only goes 4 back, when trained end to end, since the next input is based on lots of context gathered from compressed states, the system should be able to learn to apply that convolution across an arbitrarily spaced pattern of 4 on each channel.
 
 *note, I'm not sure if dA or dB play more of a role in selective state. I'm guessing it's dB and that dA is a combination of a fixed learned matrix 'A' combined with an input dependent 'dt'.
 
@@ -65,11 +64,11 @@ While the convolution on the next block only goes 4 back, when trained end to en
 
 This model is efficient and compressive.
 
-The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. So this may not be acting like a typical convolution. It's miraculous they can compress so much over a depth of 4. Perhaps by increasing the depth we could get a quadratic return in capturing long range dependencies.
+The convolution seems to be doing something very similar to the pattern matching in the attention heads of the transformer. The transformer uses the entire context and so can take the dot product horizontally whereas mamba is using a compressed context and takes the dot product vertically. So this may not be acting like a typical convolution because it's over compressed states and you want more than just mathematical pattern matching. It's miraculous they can compress so much over a depth of 4. 
 
-Another possibility is to both increase the depth and also do something similar to the softmax activation on either the columns or rows of the conv, pass the normal conv output forward, but apply that softmax as the gating weights (z).
+However, I can't help but think that by increasing the depth we could get a quadratic return in capturing long range dependencies and a much better return on the compression strategy.
 
-But I'm new to ML. So maybe there are some mathematical gotchas here. Like maybe The gradient wouldn't be smooth enough.
+Another possibility is to both increase the depth and also do something similar to the softmax activation on either the columns or rows of the conv, pass the conv output forward as is, but apply that softmax as the gating weights (z). If softmax is too sharp in this scenario, perhaps softplus. 
 
 ### Here's the config. It can also be found in models/mamba_2.8b_hf_config.json in this repo:
 ```json
