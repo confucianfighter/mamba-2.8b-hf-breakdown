@@ -216,9 +216,11 @@ class Mamba(nn.Module):
         
         # Split the projected hidden states into x and z components (each of shape (B, D))
         x, z = xz.chunk(2, dim=-1)  # Shape of x and z: (batch, d_inner) = (B, 5120)
-
+        # swish will be applied to z later to gate the final 5120 dimensional output before projection to 2560
+        
         # Convolution step
         if causal_conv1d_update is None:
+            
             # Roll the conv_state to the left by 1 (shifting for causal convolution)
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Shape: (B, d_inner, d_conv)
             
@@ -226,6 +228,8 @@ class Mamba(nn.Module):
             conv_state[:, :, -1] = x
             
             # Perform convolution by summing over the product of conv_state and conv1d weights
+            # Each channel is the result of the dot product of 2 4d vectors.
+            # Convolution weight dims are 5120 by 4.
             x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # Shape: (B, d_inner)
             
             # Add bias if applicable
@@ -233,6 +237,7 @@ class Mamba(nn.Module):
                 x = x + self.conv1d.bias
             
             # Apply activation function
+            # This is the activation on the residual shown in the paper
             x = self.act(x).to(dtype=dtype)
         else:
             # Use optimized causal convolution update
@@ -245,6 +250,7 @@ class Mamba(nn.Module):
             )
 
         # Project x to obtain dt, B, and C components (B, dt_rank + 2 * d_state)
+        # at this point, x has already been convolved and activated
         x_db = self.x_proj(x)  # Shape: (batch, dt_rank + 2 * d_state) = (B, 192)
         
         # Split the projection into dt, B, and C
@@ -255,7 +261,7 @@ class Mamba(nn.Module):
         # Linear projection of dt
         dt = F.linear(dt, self.dt_proj.weight)  # Shape: (batch, d_inner) = (B, 5120)
         
-        # Compute A matrix (exponentially decayed)
+        # Compute A matrix (decay)
         # the result of this function is always the same after training
         # This is so the weights can be learned on a logarithmic scale. It adds stability to training process.
         A = -torch.exp(self.A_log.float())  # Shape: (d_inner, d_state) = (5120, 16)
@@ -264,17 +270,22 @@ class Mamba(nn.Module):
         if selective_state_update is None:
             # Discretize A and B using softplus activation
             # softplus is log(1 + exp(x)). It's being used so that the value is always positive and is a smooth approximation of RelU 
+            # The architecture of this model represents a continuous equation, it must learn the right increments to utilize this in the real world. 
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             
-            # Compute dA and dB using matrix multiplication
+            # Compute dA using matrix multiplication
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))  # Shape: (batch, d_inner, d_state) = (B, 5120, 16)
+            # Compute dB using outer product: dt(bj) * B(bi) -- don't quote me. I'm not sure about this
             dB = torch.einsum("bd,bn->bdn", dt, B)  # Shape: (batch, d_inner, d_state) = (B, 5120, 16)
             
             # Update the ssm_state
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)  # Shape: (B, d_inner, d_state) = (B, 5120, 16)
             
-            # Compute the output y using einsum and adding the scaled input
+            # Compute the output y using vector matrix multiplication of ssm_state and C
             y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)  # Shape: (batch, d_inner) = (B, 5120)
+            # self.D is 1x5120 but effectively acts as a learned diagonal matrix.
+            # D is being used as a direct feedthrough for a skip connection. x (convolved and activated already) is fed through D and added to y as a residual.
+            """this is the D in y(t) = D * x(t) + C * h(t)""" 
             y = y + self.D.to(dtype) * x  # Shape: (B, 5120)
             y = y * self.act(z)  # Shape: (B, 5120)
         else:
